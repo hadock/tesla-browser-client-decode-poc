@@ -9,17 +9,21 @@
 <body>
   <header>
     <h1>Client-side decode PoC</h1>
-    <p class="tagline">MP4 → JPEG &lt;img&gt; frames + Web Audio PCM. Drive-safe: no &lt;video&gt; unless ?allowVideo=1.</p>
+    <p class="tagline">Drive-safe: JPEG &lt;img&gt; + Web Audio. No &lt;video&gt; unless ?allowVideo=1. Logs → CloudWatch.</p>
   </header>
 
   <section class="caps" id="caps">
-    <h2>Capability probe <span class="caps-hint">(screenshot this from the car)</span></h2>
+    <h2>Capability probe <span class="caps-hint">(screenshot from the car)</span></h2>
     <div class="caps-grid" id="capsGrid"></div>
+    <div class="session-line">Session <code id="sessionIdDisplay">—</code> · copy into Insights</div>
   </section>
 
   <section class="playlist" id="playlistSection">
+    <button type="button" id="btnForcePack" class="force-pack" disabled>
+      ▶ Force pack fallback (recommended in car)
+    </button>
     <button type="button" id="btnPlayAll" class="play-all" disabled>
-      ▶ Play all — playlist
+      ▶ Play all — try WebCodecs then pack
     </button>
     <label class="loop-label">
       <input type="checkbox" id="chkLoop" checked />
@@ -38,20 +42,23 @@
     <label class="url-label">Or paste a video URL
       <input id="urlInput" type="url" placeholder="https://example.com/clip.mp4 (needs CORS)" />
     </label>
-    <p class="hint">Hosted clips are same-origin. Live decode uses WebCodecs (no &lt;video&gt;). If VideoDecoder is missing, a labeled JPEG+PCM pack fallback is used — still no &lt;video&gt;. Pass <code>?allowVideo=1</code> only for phone debugging of the old media-element path.</p>
+    <p class="hint">Car tip: tap <strong>Force pack fallback</strong> first. WebCodecs APIs may exist but hang on Tesla Chromium — packs are JPEG+PCM, zero &lt;video&gt;. Flags: <code>?pack=1</code> <code>?preferPack=1</code> <code>?allowVideo=1</code>.</p>
   </section>
 
   <section class="stage">
-    <!-- Intentional: the user sees an <img>, NEVER a <video>. -->
     <img id="frame" alt="Decoded JPEG frame" width="1280" height="720" />
     <canvas id="scratch" width="1280" height="720" hidden></canvas>
-    <!-- <video> is NOT in the DOM. Created only if ?allowVideo=1. -->
   </section>
 
   <section class="controls">
     <button id="btnPlay" disabled>Play</button>
     <button id="btnStop" disabled>Stop</button>
     <span id="status" class="status">Pick a clip</span>
+  </section>
+
+  <section class="load-status" id="loadStatusBox">
+    <span class="k">Load</span>
+    <span id="loadStatus">idle</span>
   </section>
 
   <section class="hud" id="hud">
@@ -73,10 +80,11 @@
   </section>
 
   <footer>
-    <p>Responsible disclosure PoC — Drive-mode media bypass via client-side decode / JPEG+PCM. Not a consumer product.</p>
+    <p>Responsible disclosure PoC — Drive-mode media bypass. Not a consumer product.</p>
   </footer>
 
   <script src="vendor/mp4box.all.min.js"></script>
+  <script src="config.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

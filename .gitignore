@@ -11,3 +11,5 @@ build/
 media/*.mp4
 packs/
 media/*.mp4
+
+.deploy/

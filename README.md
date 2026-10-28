@@ -97,3 +97,15 @@ DISCLOSURE.md Bugcrowd framing
 
 See `DISCLOSURE.md` and `SECURITY.md`. This is intentional, minimal, and
 not a consumer product. Invite only Tesla / Bugcrowd reviewers.
+
+## CloudWatch browser logs
+
+Same-origin `POST /api/logs` ships structured JSON lines (`level`, `event`, `stage`, `path`, `clip`, `sessionId`, `ua`, `msg`) into log group `/tesla-browser-client-decode-poc/browser`.
+
+Saved Insights queries (created by `scripts/deploy.sh`):
+
+- **tesla-client-decode-car-failures** — timeouts, decoder errors, pack fallbacks, errors
+- **tesla-client-decode-session** — paste `sessionId` from the page HUD into the filter
+
+Console: CloudWatch → Logs → Insights → select the saved query.
+Car tip: open `?pack=1` or tap **Force pack fallback** first; WebCodecs may probe green but stall.

@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Tesla browser client-decode PoC — static SPA + same-origin /videos/*.mp4
-  behind one CloudFront distribution. No Lambda, no Cognito (v1).
+  Tesla browser client-decode PoC — SPA + /videos + /packs behind CloudFront,
+  plus same-origin POST /api/logs → Lambda → CloudWatch Logs.
 
 Parameters:
   ProjectName:
@@ -55,12 +55,110 @@ Resources:
         SigningProtocol: sigv4
         Description: OAC for client-decode PoC bucket
 
+  BrowserLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${ProjectName}/browser"
+      RetentionInDays: 14
+
+  LogIngestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PutBrowserLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !GetAtt BrowserLogGroup.Arn
+                  - !Sub "${BrowserLogGroup.Arn}:*"
+
+  LogIngestFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-log-ingest"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt LogIngestRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          LOG_GROUP: !Ref BrowserLogGroup
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              return {"statusCode": 503, "headers": {"content-type": "application/json"}, "body": "{"error":"pending code upload"}"}
+
+  LogHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-logs"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: [POST, OPTIONS]
+        AllowHeaders: [content-type]
+        MaxAge: 86400
+
+  LogIngestIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref LogHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LogIngestFn.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+      IntegrationMethod: POST
+
+  LogRoutePost:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref LogHttpApi
+      RouteKey: "POST /api/logs"
+      Target: !Sub "integrations/${LogIngestIntegration}"
+
+  LogRouteOptions:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref LogHttpApi
+      RouteKey: "OPTIONS /api/logs"
+      Target: !Sub "integrations/${LogIngestIntegration}"
+
+  LogStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref LogHttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  LogIngestPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LogIngestFn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${LogHttpApi}/*"
+
   Distribution:
     Type: AWS::CloudFront::Distribution
     Properties:
       DistributionConfig:
         Enabled: true
-        Comment: !Sub "${ProjectName} SPA + /videos"
+        Comment: !Sub "${ProjectName} SPA + /videos + /packs + /api/logs"
         DefaultRootObject: index.html
         HttpVersion: http2
         IPV6Enabled: true
@@ -71,15 +169,39 @@ Resources:
             OriginAccessControlId: !GetAtt OriginAccessControl.Id
             S3OriginConfig:
               OriginAccessIdentity: ""
+          - Id: LogsApiOrigin
+            DomainName: !Sub "${LogHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
         DefaultCacheBehavior:
           TargetOriginId: S3Origin
           ViewerProtocolPolicy: redirect-to-https
           AllowedMethods: [GET, HEAD, OPTIONS]
           CachedMethods: [GET, HEAD]
           Compress: true
-          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
-          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # CORS-S3Origin
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
         CacheBehaviors:
+          - PathPattern: api/*
+            TargetOriginId: LogsApiOrigin
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            # CachingDisabled
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            # AllViewerExceptHostHeader — Host must be the API Gateway domain
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: packs/*
+            TargetOriginId: S3Origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
           - PathPattern: videos/*
             TargetOriginId: S3Origin
             ViewerProtocolPolicy: redirect-to-https
@@ -115,3 +237,11 @@ Outputs:
     Value: !GetAtt Distribution.DomainName
   SiteURL:
     Value: !Sub "https://${Distribution.DomainName}"
+  BrowserLogGroup:
+    Value: !Ref BrowserLogGroup
+  LogIngestUrl:
+    Value: !Sub "https://${Distribution.DomainName}/api/logs"
+  LogApiEndpoint:
+    Value: !Sub "https://${LogHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  LogIngestFnName:
+    Value: !Ref LogIngestFn

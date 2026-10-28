@@ -7,80 +7,94 @@
 <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <header>
+  <header class="topbar">
     <h1>Client-side decode PoC</h1>
-    <p class="tagline">Drive-safe: JPEG &lt;img&gt; + Web Audio. No &lt;video&gt; unless ?allowVideo=1. Debug logs → /api/logs.</p>
+    <p class="tagline">Drive-safe: JPEG &lt;img&gt; + Web Audio · no &lt;video&gt; unless ?allowVideo=1</p>
   </header>
 
-  <section class="caps" id="caps">
-    <h2>Capability probe <span class="caps-hint">(screenshot from the car)</span></h2>
-    <div class="caps-grid" id="capsGrid"></div>
-    <div class="session-line">Session <code id="sessionIdDisplay">—</code> · search it in Workers Logs</div>
-  </section>
+  <main class="watch">
+    <div class="primary">
+      <section class="stage idle" id="stage" role="button" tabindex="0" aria-label="Play / pause">
+        <img id="frame" alt="Decoded JPEG frame" width="1280" height="720" />
+        <canvas id="scratch" width="1280" height="720" hidden></canvas>
+        <div class="overlay" id="stageOverlay"><span class="overlay-btn" id="overlayIcon">▶</span></div>
+        <div class="stage-status" id="stageStatus" hidden></div>
+      </section>
 
-  <section class="playlist" id="playlistSection">
-    <button type="button" id="btnForcePack" class="force-pack" disabled>
-      ▶ Force pack fallback (recommended in car)
-    </button>
-    <button type="button" id="btnPlayAll" class="play-all" disabled>
-      ▶ Play all (pack; add ?wc=1 to try WebCodecs)
-    </button>
-    <label class="loop-label">
-      <input type="checkbox" id="chkLoop" checked />
-      Loop playlist
-    </label>
-    <div id="nowPlaying" class="now-playing" hidden>
-      <span class="k">Now playing</span>
-      <span id="nowPlayingText">—</span>
-      <span id="nowPlayingPos" class="pos"></span>
+      <section class="np" id="nowPlaying">
+        <div class="np-head">
+          <div>
+            <h2 id="nowPlayingText">—</h2>
+            <div class="np-artist"><span id="npArtist"></span> <span id="nowPlayingPos" class="pos"></span></div>
+          </div>
+        </div>
+        <div class="controls">
+          <button type="button" id="btnPlayAll" class="play-all" disabled>▶ Play all</button>
+          <button type="button" id="btnStop" disabled>■ Stop</button>
+          <label class="loop-label">
+            <input type="checkbox" id="chkAutoplay" checked /> Autoplay next
+          </label>
+          <label class="loop-label">
+            <input type="checkbox" id="chkLoop" checked /> Loop
+          </label>
+          <span id="status" class="status">Tap a clip to play</span>
+        </div>
+        <div class="attribution" id="attribution" hidden>
+          <strong>Attribution</strong>
+          <span id="attrText"></span>
+          · <a id="attrLicense" href="#" target="_blank" rel="noopener">license</a>
+          · <a id="attrSource" href="#" target="_blank" rel="noopener">source</a>
+        </div>
+      </section>
     </div>
-  </section>
 
-  <section class="picker" id="picker">
-    <h2>Or pick one clip</h2>
-    <div id="clipList" class="clip-list"></div>
-    <label class="url-label">Or paste a video URL
-      <input id="urlInput" type="url" placeholder="https://example.com/clip.mp4 (needs CORS)" />
-    </label>
-    <p class="hint">Car tip: tap <strong>Force pack fallback</strong> first. WebCodecs APIs may exist but hang on Tesla Chromium — packs are JPEG+PCM, zero &lt;video&gt;. Flags: <code>?pack=1</code> <code>?preferPack=1</code> <code>?wc=1</code> <code>?allowVideo=1</code>.</p>
-  </section>
+    <aside class="sidebar">
+      <h2 class="sidebar-h">Playlist <span id="playlistCount" class="muted"></span></h2>
+      <div id="clipList" class="clip-list" role="list"></div>
+    </aside>
+  </main>
 
-  <section class="stage">
-    <img id="frame" alt="Decoded JPEG frame" width="1280" height="720" />
-    <canvas id="scratch" width="1280" height="720" hidden></canvas>
-  </section>
+  <details class="debug" id="debugPanel">
+    <summary>Debug</summary>
 
-  <section class="controls">
-    <button id="btnPlay" disabled>Play</button>
-    <button id="btnStop" disabled>Stop</button>
-    <span id="status" class="status">Pick a clip</span>
-  </section>
+    <section class="caps" id="caps">
+      <h3>Capability probe <span class="caps-hint">(screenshot from the car)</span></h3>
+      <div class="caps-grid" id="capsGrid"></div>
+      <div class="session-line">Session <code id="sessionIdDisplay">—</code> · search it in Workers Logs</div>
+    </section>
 
-  <section class="load-status" id="loadStatusBox">
-    <span class="k">Load</span>
-    <span id="loadStatus">idle</span>
-  </section>
+    <section class="debug-controls">
+      <button type="button" id="btnForcePack" class="force-pack" disabled>▶ Force pack fallback (play all, pack)</button>
+      <button type="button" id="btnTryWC" disabled>Try WebCodecs on selected clip</button>
+      <button type="button" id="btnPlay" disabled>Play selected (default path)</button>
+    </section>
 
-  <section class="hud" id="hud">
-    <div><span class="k">WebCodecs</span> <span id="hWebCodecs">?</span></div>
-    <div><span class="k">Path</span> <span id="hPath">—</span></div>
-    <div><span class="k">Renderer</span> <span id="hRenderer">—</span></div>
-    <div><span class="k">FPS</span> <span id="hFps">—</span></div>
-    <div><span class="k">Frames</span> <span id="hFrames">0</span></div>
-    <div><span class="k">Audio</span> <span id="hAudio">—</span></div>
-    <div><span class="k">Video el</span> <span id="hVideoEl">0</span></div>
-    <div><span class="k">T</span> <span id="hTime">0.0s</span></div>
-  </section>
+    <section class="load-status" id="loadStatusBox">
+      <span class="k">Load</span>
+      <span id="loadStatus">idle</span>
+    </section>
 
-  <section class="attribution" id="attribution" hidden>
-    <strong>Attribution</strong>
-    <span id="attrText"></span>
-    · <a id="attrLicense" href="#" target="_blank" rel="noopener">license</a>
-    · <a id="attrSource" href="#" target="_blank" rel="noopener">source</a>
-  </section>
+    <section class="hud" id="hud">
+      <div><span class="k">WebCodecs</span> <span id="hWebCodecs">?</span></div>
+      <div><span class="k">Path</span> <span id="hPath">—</span></div>
+      <div><span class="k">Renderer</span> <span id="hRenderer">—</span></div>
+      <div><span class="k">FPS</span> <span id="hFps">—</span></div>
+      <div><span class="k">Frames</span> <span id="hFrames">0</span></div>
+      <div><span class="k">Audio</span> <span id="hAudio">—</span></div>
+      <div><span class="k">Video el</span> <span id="hVideoEl">0</span></div>
+      <div><span class="k">T</span> <span id="hTime">0.0s</span></div>
+    </section>
+
+    <section class="picker">
+      <label class="url-label">Paste a video URL (debug)
+        <input id="urlInput" type="url" placeholder="https://example.com/clip.mp4 (needs CORS)" />
+      </label>
+      <p class="hint">Packs are JPEG+PCM, zero &lt;video&gt;. WebCodecs may probe green but hang on Tesla Chromium. Flags: <code>?pack=1</code> (autostart) <code>?wc=1</code> <code>?allowVideo=1</code>. Debug logs → <code>/api/logs</code>.</p>
+    </section>
+  </details>
 
   <footer>
-    <p>Responsible disclosure PoC — Drive-mode media bypass. Not a consumer product.</p>
+    <p>Responsible disclosure PoC — Drive-mode media bypass. Not a consumer product. Test parked.</p>
   </footer>
 
   <script src="vendor/mp4box.all.min.js"></script>

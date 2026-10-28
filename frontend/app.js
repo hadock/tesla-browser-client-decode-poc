@@ -1,4 +1,4 @@
-/* Tesla Browser Client Decode PoC — Drive-safe + CloudWatch client logs
+/* Tesla Browser Client Decode PoC — Drive-safe + client debug logs (/api/logs)
  * Paths: pack (recommended) | WebCodecs (10s timeout → pack) | ?allowVideo=1 debug
  * Zero <video> unless allowVideo=1.
  */
@@ -52,6 +52,13 @@
   const nowPlayingPos = $("nowPlayingPos");
   const capsGrid = $("capsGrid");
   const sessionIdDisplay = $("sessionIdDisplay");
+  const stageEl = $("stage");
+  const stageStatus = $("stageStatus");
+  const overlayIcon = $("overlayIcon");
+  const chkAutoplay = $("chkAutoplay");
+  const btnTryWC = $("btnTryWC");
+  const npArtist = $("npArtist");
+  const playlistCount = $("playlistCount");
 
   const hud = {
     web: $("hWebCodecs"),
@@ -95,6 +102,10 @@
   let playGen = 0;          // bumps on every new attempt; zombie loops check it
   let paintedCount = 0;     // frames actually loaded+shown by <img>
   let assignedCount = 0;    // frames we tried to show
+  let userPaused = false;   // tap-on-player pause (pack path)
+  let runSeq = 0;           // bumps per playSelected/playPlaylist run; stale runs don't touch UI
+  let runPromise = null;    // current run, awaited before switching clips
+  let switchToken = 0;      // latest playlist tap wins
   function isAborted(gen) { return stopRequested || gen !== playGen; }
 
   /* ---------- CloudWatch client logger ---------- */
@@ -161,9 +172,23 @@
     if (loadStatusEl) loadStatusEl.textContent = stage;
     cwLog("info", "stage", Object.assign({ stage: stage, msg: stage }, extra || {}));
     setStatus(stage);
+    updateStageUi();
   }
 
   function setStatus(msg) { statusEl.textContent = msg; }
+
+  function updateStageUi() {
+    stageEl.classList.toggle("playing", playing);
+    stageEl.classList.toggle("paused", playing && userPaused);
+    overlayIcon.textContent = playing && !userPaused ? "❚❚" : "▶";
+    const showMsg = playing && (userPaused || (currentStage !== "playing" && currentStage !== "first pack frame painted"));
+    stageStatus.hidden = !showMsg;
+    if (showMsg) stageStatus.textContent = userPaused ? "Paused — tap to resume" : currentStage;
+  }
+
+  function thumbUrl(clip) {
+    return "/packs/" + clip.slug + "/frames/000350.jpg";
+  }
 
   function setPath(label, ok) {
     currentPath = label;
@@ -227,6 +252,7 @@
   frameEl.decoding = "sync";
   frameEl.addEventListener("load", function () {
     imgBusy = false;
+    if (frameEl.src) stageEl.classList.remove("idle");
     paintedCount++;
     frameCount = paintedCount;
     tickFps();
@@ -779,6 +805,20 @@
     let lastBeatPainted = paintedCount;
     try {
       while (!isAborted(gen)) {
+        if (userPaused) {
+          const p0 = performance.now();
+          if (ctx && !audioEnded && ctx.state === "running") { try { await ctx.suspend(); } catch (_) {} }
+          cwLog("info", "pause", { msg: "paused at frame " + due, frame: due });
+          while (userPaused && !isAborted(gen)) await new Promise(function (r) { setTimeout(r, 50); });
+          const d = performance.now() - p0;
+          if (!ctx) pausedMs += d;
+          if (ctx && !audioEnded && ctx.state !== "running") { try { await ctx.resume(); } catch (_) {} }
+          if (isAborted(gen)) break;
+          cwLog("info", "resume", { msg: "resumed after " + Math.round(d) + "ms", durMs: Math.round(d) });
+          updateStageUi();
+          lastLoop = performance.now(); lastBeat = performance.now();
+          continue;
+        }
         const now = performance.now();
         const gap = now - lastLoop; lastLoop = now;
         if (gap > loopGapMaxMs) loopGapMaxMs = gap;
@@ -939,16 +979,22 @@
   }
 
   function updateNowPlaying(clip, index, total) {
-    if (!clip) { nowPlaying.hidden = true; return; }
-    nowPlaying.hidden = false;
-    nowPlayingText.textContent = clip.artist + ' — "' + clip.title + '"';
-    nowPlayingPos.textContent = "(" + (index + 1) + " / " + total + ")";
+    if (!clip) { nowPlayingText.textContent = "Custom URL"; npArtist.textContent = ""; nowPlayingPos.textContent = ""; return; }
+    nowPlayingText.textContent = clip.title;
+    npArtist.textContent = clip.artist;
+    nowPlayingPos.textContent = index >= 0 && total ? "· " + (index + 1) + " / " + total : "";
+  }
+
+  function setPoster(clip) {
+    stageEl.style.backgroundImage = clip ? 'url("' + thumbUrl(clip) + '")' : "";
+    stageEl.classList.add("idle");      // hide the old frame until the new clip paints
   }
 
   async function playOneClean(src, meta, opts) {
     opts = opts || {};
     const usePack = !!(opts.forcePack || FORCE_PACK || (forcePackMode && meta && meta.pack && !opts.tryWebCodecs));
     currentClip = meta;
+    setPoster(meta);
     resetHud();
     setStage("loading…");
     showAttribution(meta || null);
@@ -1051,21 +1097,24 @@
 
   async function playSelected(opts) {
     if (!selected || !selected.src || playing) return;
+    const myRun = ++runSeq;
     playlistMode = false;
     playlistActive = false;
-    nowPlaying.hidden = true;
     stopRequested = false;
+    userPaused = false;
     playing = true;
+    updateStageUi();
     btnPlay.disabled = true;
-    btnPlayAll.disabled = true;
-    btnForcePack.disabled = true;
     btnStop.disabled = false;
 
     const ok = await playOneClean(selected.src, selected.meta || null, opts || {});
+    if (myRun !== runSeq) return;     // superseded by a newer tap
     if (ok) setStatus("Finished");
     else if (stopRequested) setStatus("Stopped");
 
     playing = false;
+    userPaused = false;
+    updateStageUi();
     btnPlay.disabled = !selected;
     btnPlayAll.disabled = !(catalog && catalog.clips && catalog.clips.length);
     btnForcePack.disabled = btnPlayAll.disabled;
@@ -1076,21 +1125,22 @@
   async function playPlaylist(opts) {
     if (!catalog || !catalog.clips || !catalog.clips.length || playing) return;
     opts = opts || {};
+    const myRun = ++runSeq;
     playlistMode = true;
     playlistActive = true;
     stopRequested = false;
+    userPaused = false;
     playing = true;
-    playlistIndex = 0;
+    playlistIndex = Math.max(0, Math.min(catalog.clips.length - 1, opts.startIndex | 0));
+    updateStageUi();
     btnPlay.disabled = true;
-    btnPlayAll.disabled = true;
-    btnForcePack.disabled = true;
     btnStop.disabled = false;
 
     const clips = catalog.clips;
     const total = clips.length;
     cwLog("info", "stage", { stage: "playlist start", msg: "clips=" + total + " forcePack=" + !!opts.forcePack });
 
-    while (playlistActive && !stopRequested) {
+    while (playlistActive && !stopRequested && myRun === runSeq) {
       const clip = clips[playlistIndex];
       selected = { src: clip.src, meta: clip };
       updateNowPlaying(clip, playlistIndex, total);
@@ -1098,7 +1148,8 @@
       cwLog("info", "stage", { stage: "playlist advance", clip: clip.slug, msg: (playlistIndex + 1) + "/" + total });
 
       const finished = await playOneClean(clip.src, clip, opts);
-      if (!finished || stopRequested) break;
+      if (!finished || stopRequested || myRun !== runSeq) break;
+      if (chkAutoplay && !chkAutoplay.checked) { setStatus("Finished — tap a clip"); break; }
 
       playlistIndex += 1;
       if (playlistIndex >= total) {
@@ -1115,11 +1166,15 @@
       }
     }
 
-    if (stopRequested) setStatus("Playlist stopped");
+    if (myRun !== runSeq) return;     // superseded by a newer tap
+    if (stopRequested) setStatus("Stopped");
     playlistActive = false;
     playlistMode = false;
     playing = false;
+    userPaused = false;
+    updateStageUi();
     btnPlay.disabled = !selected;
+    btnTryWC.disabled = !selected;
     btnPlayAll.disabled = false;
     btnForcePack.disabled = false;
     btnStop.disabled = true;
@@ -1131,11 +1186,65 @@
     stopRequested = true;
     playGen++;
     playlistActive = false;
+    userPaused = false;
     try { if (hiddenVideo) hiddenVideo.pause(); } catch (_) {}
     stopAudio();
     setStage(playlistMode ? "playlist stopped" : "stopped");
     cwLog("info", "stage", { stage: "stopped" });
     flushLogs();
+  }
+
+  // Must be called synchronously inside a tap handler: creating/resuming the
+  // AudioContext and starting a (silent) source there unlocks audio for later awaits.
+  function unlockAudio() {
+    try {
+      const ctx = ensureAudioCtx();
+      const b = ctx.createBuffer(1, 1, 22050);
+      const src = ctx.createBufferSource();
+      src.buffer = b; src.connect(ctx.destination); src.start(0);
+    } catch (e) {
+      cwLog("warn", "error", { msg: "audio unlock failed: " + (e && e.message) });
+    }
+  }
+
+  // Stop whatever is playing (reusing stopPlayback / playGen kill), wait for that
+  // run to unwind, then start the given clip with the default pack player.
+  async function startFromIndex(index, opts) {
+    const token = ++switchToken;
+    unlockAudio();                                    // still inside the user gesture
+    const clip = catalog.clips[index];
+    if (clip) { selected = { src: clip.src, meta: clip }; highlightPlaying(clip.slug); updateNowPlaying(clip, index, catalog.clips.length); setPoster(clip); showAttribution(clip); }
+    cwLog("info", "stage", { stage: "tap play", clip: clip && clip.slug, msg: "tap row " + index + (playing ? " (switch)" : "") });
+    if (playing) {
+      stopPlayback();
+      const prev = runPromise;
+      if (prev) await Promise.race([prev.catch(function () {}), new Promise(function (r) { setTimeout(r, 4000); })]);
+      if (token !== switchToken) return;              // a newer tap took over
+      stopAudio();
+      playing = false;
+    }
+    runPromise = playPlaylist(Object.assign({ forcePack: true }, opts || {}, { startIndex: index }));
+    return runPromise;
+  }
+
+  function togglePlayPause() {
+    if (!catalog || !catalog.clips.length) return;
+    if (!playing) {
+      const slug = selected && selected.meta && selected.meta.slug;
+      let idx = catalog.clips.findIndex(function (c) { return c.slug === slug; });
+      startFromIndex(idx < 0 ? 0 : idx);
+      return;
+    }
+    userPaused = !userPaused;
+    if (audioCtx) {                                   // act on audio inside the gesture
+      try { if (userPaused) audioCtx.suspend(); else audioCtx.resume(); } catch (_) {}
+    }
+    if (userPaused) setStage("paused"); else setStage("playing");
+  }
+
+  function fmtDur(sec) {
+    sec = Math.round(sec);
+    return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0");
   }
 
   function selectClip(clip) {
@@ -1147,8 +1256,11 @@
     });
     urlInput.value = "";
     btnPlay.disabled = false;
+    btnTryWC.disabled = false;
     showAttribution(clip);
-    setStatus("Ready — " + clip.artist);
+    setPoster(clip);
+    updateNowPlaying(clip, catalog.clips.indexOf(clip), catalog.clips.length);
+    setStatus("Tap the player or a clip to play");
   }
 
   function selectUrl(url) {
@@ -1160,22 +1272,43 @@
     });
     btnPlay.disabled = false;
     showAttribution(null);
-    nowPlaying.hidden = true;
+    updateNowPlaying(null);
+    setPoster(null);
     setStatus("Ready — custom URL");
   }
 
   async function boot() {
     renderCaps();
     catalog = await fetch("catalog.json").then(function (r) { return r.json(); });
-    catalog.clips.forEach(function (c) {
+    playlistCount.textContent = "· " + catalog.clips.length + " clips";
+    catalog.clips.forEach(function (c, i) {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "clip";
       btn.dataset.slug = c.slug;
-      btn.innerHTML = '<div class="title">' + c.artist + " — " + c.title + "</div>" +
-        '<div class="meta">' + c.description + " · " + c.license + " · " + c.segment + "</div>";
-      btn.addEventListener("click", function () { selectClip(c); });
+      btn.setAttribute("role", "listitem");
+      const thumb = document.createElement("div"); thumb.className = "thumb";
+      const im = document.createElement("img"); im.alt = ""; im.loading = "lazy"; im.src = thumbUrl(c);
+      const dur = document.createElement("span"); dur.className = "dur"; dur.textContent = "1:10";
+      const now = document.createElement("span"); now.className = "now"; now.textContent = "NOW PLAYING";
+      thumb.appendChild(im); thumb.appendChild(dur); thumb.appendChild(now);
+      const txt = document.createElement("div");
+      const t = document.createElement("div"); t.className = "title"; t.textContent = c.title;
+      const a = document.createElement("div"); a.className = "artist"; a.textContent = c.artist;
+      const m = document.createElement("div"); m.className = "meta"; m.textContent = c.license;
+      txt.appendChild(t); txt.appendChild(a); txt.appendChild(m);
+      btn.appendChild(thumb); btn.appendChild(txt);
+      btn.addEventListener("click", function () { startFromIndex(i); });
       clipList.appendChild(btn);
+      if (c.pack) fetch(c.pack).then(function (r) { return r.json(); }).then(function (mf) {
+        const n = mf.frame_count || (mf.frames && mf.frames.length);
+        if (n && mf.fps) dur.textContent = fmtDur(n / mf.fps);
+        if (mf.frames && mf.frames.length) {
+          const mid = mf.frames[Math.floor(mf.frames.length / 2)];
+          const u = (mf.frames_prefix || ("/packs/" + c.slug + "/frames/")) + mid;
+          if (im.src.indexOf(mid) < 0) im.src = u;
+        }
+      }).catch(function () {});
     });
     const def = catalog.clips.find(function (c) { return c.slug === catalog.defaultClip; }) || catalog.clips[0];
     if (def) selectClip(def);
@@ -1188,27 +1321,34 @@
       if (e.key === "Enter") selectUrl(urlInput.value.trim());
     });
     btnPlay.addEventListener("click", function () {
-      if (!playing) playSelected({ tryWebCodecs: TRY_WC, forcePack: FORCE_PACK });
+      unlockAudio();
+      if (!playing) runPromise = playSelected({ tryWebCodecs: TRY_WC, forcePack: FORCE_PACK });
+    });
+    btnTryWC.addEventListener("click", function () {
+      unlockAudio();
+      if (!playing) runPromise = playSelected({ tryWebCodecs: true });
     });
     btnPlayAll.addEventListener("click", function () {
-      if (!playing) playPlaylist({ tryWebCodecs: TRY_WC, forcePack: false });
+      chkAutoplay.checked = true;
+      startFromIndex(0, TRY_WC ? { forcePack: false, tryWebCodecs: true } : {});
     });
     btnForcePack.addEventListener("click", function () {
-      if (!playing) {
-        forcePackMode = true;
-        playPlaylist({ forcePack: true });
-      }
+      forcePackMode = true;
+      chkAutoplay.checked = true;
+      startFromIndex(0, { forcePack: true });
     });
-    btnStop.addEventListener("click", stopPlayback);
+    btnStop.addEventListener("click", function () { stopPlayback(); updateStageUi(); });
+    stageEl.addEventListener("click", togglePlayPause);
+    stageEl.addEventListener("keydown", function (e) { if (e.key === " " || e.key === "Enter") { e.preventDefault(); togglePlayPause(); } });
 
-    setStage("idle — tap Force pack fallback (recommended)");
+    setStage("idle — tap a clip to play");
     setPath(forcePackMode ? "prefer pack" : (webCodecsOk ? "WebCodecs ready" : "pack only"), webCodecsOk && !forcePackMode);
     refreshVideoElHud();
     flushLogs();
 
     // Auto-start pack playlist if ?pack=1
     if (FORCE_PACK && catalog.clips.length) {
-      setTimeout(function () { playPlaylist({ forcePack: true }); }, 300);
+      setTimeout(function () { startFromIndex(0, { forcePack: true }); }, 300);
     }
   }
 

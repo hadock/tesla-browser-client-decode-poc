@@ -23,7 +23,7 @@
       ▶ Force pack fallback (recommended in car)
     </button>
     <button type="button" id="btnPlayAll" class="play-all" disabled>
-      ▶ Play all — try WebCodecs then pack
+      ▶ Play all (pack; add ?wc=1 to try WebCodecs)
     </button>
     <label class="loop-label">
       <input type="checkbox" id="chkLoop" checked />
@@ -42,7 +42,7 @@
     <label class="url-label">Or paste a video URL
       <input id="urlInput" type="url" placeholder="https://example.com/clip.mp4 (needs CORS)" />
     </label>
-    <p class="hint">Car tip: tap <strong>Force pack fallback</strong> first. WebCodecs APIs may exist but hang on Tesla Chromium — packs are JPEG+PCM, zero &lt;video&gt;. Flags: <code>?pack=1</code> <code>?preferPack=1</code> <code>?allowVideo=1</code>.</p>
+    <p class="hint">Car tip: tap <strong>Force pack fallback</strong> first. WebCodecs APIs may exist but hang on Tesla Chromium — packs are JPEG+PCM, zero &lt;video&gt;. Flags: <code>?pack=1</code> <code>?preferPack=1</code> <code>?wc=1</code> <code>?allowVideo=1</code>.</p>
   </section>
 
   <section class="stage">

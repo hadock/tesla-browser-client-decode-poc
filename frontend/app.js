@@ -11,6 +11,7 @@
   const FORCE_PACK = params.get("pack") === "1";
   const PREFER_PACK = params.get("preferPack") !== "0"; // default prefer pack in car
   const FORCE_DRIVE = params.get("drive") === "1";
+  const TRY_WC = params.get("wc") === "1"; // opt-in: WebCodecs first (car stalls; pack is default)
   const CFG = window.POC_CONFIG || {};
   const LOGS_URL = CFG.logsUrl || "/api/logs";
   const WC_TIMEOUT_MS = CFG.webCodecsTimeoutMs || 10000;
@@ -91,6 +92,10 @@
   let currentClip = null;
   let currentPath = "—";
   let currentStage = "idle";
+  let playGen = 0;          // bumps on every new attempt; zombie loops check it
+  let paintedCount = 0;     // frames actually loaded+shown by <img>
+  let assignedCount = 0;    // frames we tried to show
+  function isAborted(gen) { return stopRequested || gen !== playGen; }
 
   /* ---------- CloudWatch client logger ---------- */
   const logQueue = [];
@@ -189,6 +194,9 @@
 
   function resetHud() {
     frameCount = 0;
+    paintedCount = 0;
+    assignedCount = 0;
+    imgBusy = false;
     fpsWindow = [];
     hud.frames.textContent = "0";
     hud.fps.textContent = "—";
@@ -206,31 +214,50 @@
     hud.frames.textContent = String(frameCount);
   }
 
-  async function pushFrameFromCanvas() {
+  // Paint path: only count a frame once the <img> has actually loaded it.
+  // Never assign a new src while the previous one is still loading (that aborts
+  // the in-flight load and the picture freezes while counters keep ticking).
+  let imgBusy = false;
+  let prevObjectUrl = null;
+  frameEl.decoding = "sync";
+  frameEl.addEventListener("load", function () {
+    imgBusy = false;
+    paintedCount++;
+    frameCount = paintedCount;
+    tickFps();
+    if (prevObjectUrl) { URL.revokeObjectURL(prevObjectUrl); prevObjectUrl = null; }
+  });
+  frameEl.addEventListener("error", function () {
+    imgBusy = false;
+    cwLog("warn", "error", { msg: "img load error " + String(frameEl.src).slice(-40) });
+  });
+
+  function setImgSrc(url, isObjectUrl) {
+    if (imgBusy) return false;            // drop frame, keep the current picture
+    imgBusy = true;
+    assignedCount++;
+    if (isObjectUrl) { prevObjectUrl = objectUrl; objectUrl = url; }
+    frameEl.src = url;
+    return true;
+  }
+
+  let blobBusy = false;
+  async function pushFrameFromCanvas(gen) {
+    if (gen !== undefined && isAborted(gen)) return false;
+    if (blobBusy || imgBusy) return false;  // backpressure: skip, don't queue
+    blobBusy = true;
     return new Promise(function (resolve) {
       if (scratch.toBlob) {
         scratch.toBlob(function (blob) {
-          if (!blob) { resolve(false); return; }
-          revokeObjectUrl();
-          objectUrl = URL.createObjectURL(blob);
-          frameEl.src = objectUrl;
-          frameCount++;
-          tickFps();
-          resolve(true);
+          blobBusy = false;
+          if (!blob || (gen !== undefined && isAborted(gen))) { resolve(false); return; }
+          resolve(setImgSrc(URL.createObjectURL(blob), true));
         }, "image/jpeg", 0.7);
       } else {
-        frameEl.src = scratch.toDataURL("image/jpeg", 0.7);
-        frameCount++;
-        tickFps();
-        resolve(true);
+        blobBusy = false;
+        resolve(setImgSrc(scratch.toDataURL("image/jpeg", 0.7), false));
       }
     });
-  }
-
-  function showJpegUrl(url) {
-    frameEl.src = url;
-    frameCount++;
-    tickFps();
   }
 
   function ensureAudioCtx() {
@@ -410,7 +437,7 @@
     return { ab: ab, file: file, info: info, samples: samples };
   }
 
-  async function playViaWebCodecs(url) {
+  async function playViaWebCodecs(url, gen, onFetched) {
     if (!webCodecsOk) throw new Error("WebCodecs unavailable");
     setPath("WebCodecs", true);
     hud.renderer.textContent = "WebCodecs → canvas → JPEG <img>";
@@ -418,128 +445,132 @@
     refreshVideoElHud();
 
     const demuxed = await demuxMp4(url);
+    if (onFetched) onFetched();
+    if (isAborted(gen)) return;
     const videoTrack = demuxed.info.videoTracks[0];
-    if (!videoTrack || !demuxed.samples.video.length) {
-      throw new Error("no video samples in MP4");
-    }
+    if (!videoTrack || !demuxed.samples.video.length) throw new Error("no video samples in MP4");
 
     setStage("configure VideoDecoder…");
     const description = getAvcDescription(demuxed.file, videoTrack.id);
     const codec = videoTrack.codec || "avc1.42E01E";
     const w = videoTrack.track_width || 1280;
     const h = videoTrack.track_height || 720;
-    scratch.width = w;
-    scratch.height = h;
+    scratch.width = w; scratch.height = h;
     const timescale = videoTrack.timescale || 1000;
 
-    const decodedFrames = [];
+    // Streaming: keep only a few VideoFrames alive. Holding hundreds of
+    // unclosed frames starves the HW decoder pool and stalls output (car hang).
+    const queue = [];
     let decoderError = null;
-    const videoDecoder = new VideoDecoder({
-      output: function (frame) { decodedFrames.push(frame); },
+    let outCount = 0;
+    const dec = new VideoDecoder({
+      output: function (frame) {
+        if (isAborted(gen)) { frame.close(); return; }
+        outCount++;
+        queue.push(frame);
+      },
       error: function (e) {
         decoderError = e;
         cwLog("error", "decoder_error", { msg: String(e && (e.message || e)), stage: "VideoDecoder.onerror" });
-        setStage("decoder error: " + (e && e.message ? e.message : e));
       },
     });
-    const config = { codec: codec, codedWidth: w, codedHeight: h };
+    const config = { codec: codec, codedWidth: w, codedHeight: h, hardwareAcceleration: "no-preference" };
     if (description) config.description = description;
     cwLog("info", "stage", { stage: "configure VideoDecoder…", msg: "codec=" + codec + " desc=" + (description ? description.byteLength + "b" : "none") });
-
-    try {
-      if (VideoDecoder.isConfigSupported) {
-        const support = await VideoDecoder.isConfigSupported(config);
-        if (!support.supported) {
-          cwLog("error", "decoder_error", { msg: "config unsupported: " + codec });
-          throw new Error("VideoDecoder config unsupported: " + codec);
-        }
-      }
-      videoDecoder.configure(config);
-    } catch (e) {
-      cwLog("error", "decoder_error", { msg: "configure failed: " + e.message });
-      throw e;
+    if (VideoDecoder.isConfigSupported) {
+      const support = await VideoDecoder.isConfigSupported(config);
+      if (!support.supported) { cwLog("error", "decoder_error", { msg: "config unsupported: " + codec }); throw new Error("VideoDecoder config unsupported: " + codec); }
     }
+    dec.configure(config);
 
     setStage("decode frames…");
-    for (let i = 0; i < demuxed.samples.video.length; i++) {
-      if (stopRequested) break;
-      const s = demuxed.samples.video[i];
-      const chunk = new EncodedVideoChunk({
-        type: s.is_sync ? "key" : "delta",
-        timestamp: (s.cts * 1e6) / timescale,
-        duration: (s.duration * 1e6) / timescale,
-        data: s.data,
-      });
-      try { videoDecoder.decode(chunk); } catch (e) {
-        cwLog("warn", "decoder_error", { msg: "decode chunk: " + e.message });
+    const samples = demuxed.samples.video;
+    let fed = 0;
+    function feed() {
+      while (fed < samples.length && queue.length + dec.decodeQueueSize < 6 && !isAborted(gen)) {
+        const s = samples[fed++];
+        try {
+          dec.decode(new EncodedVideoChunk({
+            type: s.is_sync ? "key" : "delta",
+            timestamp: (s.cts * 1e6) / timescale,
+            duration: (s.duration * 1e6) / timescale,
+            data: s.data,
+          }));
+        } catch (e) { cwLog("warn", "decoder_error", { msg: "decode chunk: " + e.message }); }
       }
+      if (fed >= samples.length && dec.state === "configured") { dec.flush().catch(function () {}); fed++; }
     }
-    await videoDecoder.flush();
-    if (decoderError) throw decoderError;
-    if (!decodedFrames.length) throw new Error("VideoDecoder produced 0 frames");
 
-    setStage("decode first frame…");
-    decodedFrames.sort(function (a, b) { return a.timestamp - b.timestamp; });
-    // Prove first frame paints before we invest in audio
-    scratchCtx.drawImage(decodedFrames[0], 0, 0, scratch.width, scratch.height);
-    await pushFrameFromCanvas();
-    cwLog("info", "stage", { stage: "first frame painted", msg: "decodedFrames=" + decodedFrames.length });
-
-    setStage("audio…");
     let audioBuffer = null;
+    let t0 = 0;
+    let started = false;
+    let lastBeat = performance.now();
     try {
-      const ctx = ensureAudioCtx();
-      audioBuffer = await ctx.decodeAudioData(demuxed.ab.slice(0));
-    } catch (e) {
-      cwLog("warn", "error", { msg: "decodeAudioData failed: " + e.message });
-      hud.audio.textContent = "none";
-    }
-
-    setStage("playing");
-    cwLog("info", "playing", { msg: "WebCodecs playing", path: "webcodecs" });
-    btnStop.disabled = false;
-    const t0 = performance.now();
-    if (audioBuffer) playDecodedAudioBuffer(audioBuffer);
-
-    let i = 0;
-    let lastPresent = -FRAME_INTERVAL_MS;
-    // first frame already shown — close it and continue from 1
-    decodedFrames[0].close();
-    i = 1;
-    while (i < decodedFrames.length && !stopRequested) {
-      const now = performance.now() - t0;
-      if (now - lastPresent < FRAME_INTERVAL_MS) {
-        await new Promise(function (r) { setTimeout(r, 4); });
-        continue;
+      while (!isAborted(gen)) {
+        if (decoderError) throw decoderError;
+        feed();
+        if (!queue.length) {
+          if (fed > samples.length && dec.decodeQueueSize === 0) break; // done
+          await new Promise(function (r) { setTimeout(r, 5); });
+          continue;
+        }
+        if (!started) {
+          // First frame: paint immediately, then audio + clock
+          const f0 = queue.shift();
+          scratchCtx.drawImage(f0, 0, 0, scratch.width, scratch.height);
+          f0.close();
+          await pushFrameFromCanvas(gen);
+          cwLog("info", "stage", { stage: "first frame painted", msg: "webcodecs" });
+          setStage("audio…");
+          try { audioBuffer = await ensureAudioCtx().decodeAudioData(demuxed.ab.slice(0)); }
+          catch (e) { cwLog("warn", "error", { msg: "decodeAudioData failed: " + e.message }); hud.audio.textContent = "none"; }
+          if (isAborted(gen)) break;
+          setStage("playing");
+          cwLog("info", "playing", { msg: "WebCodecs playing", path: "webcodecs" });
+          btnStop.disabled = false;
+          if (audioBuffer) playDecodedAudioBuffer(audioBuffer);
+          t0 = performance.now();
+          started = true;
+          continue;
+        }
+        const nowUs = (performance.now() - t0) * 1000;
+        // Drop late frames (keep newest due one)
+        while (queue.length > 1 && queue[1].timestamp <= nowUs) queue.shift().close();
+        const f = queue[0];
+        if (f.timestamp > nowUs) { await new Promise(function (r) { setTimeout(r, 8); }); continue; }
+        queue.shift();
+        if (!imgBusy && !blobBusy) {
+          scratchCtx.drawImage(f, 0, 0, scratch.width, scratch.height);
+          f.close();
+          pushFrameFromCanvas(gen);
+        } else {
+          f.close();
+        }
+        hud.time.textContent = (nowUs / 1e6).toFixed(1) + "s";
+        if (performance.now() - lastBeat > 5000) {
+          lastBeat = performance.now();
+          cwLog("info", "heartbeat", { path: "webcodecs", msg: "decoded=" + outCount + " assigned=" + assignedCount + " painted=" + paintedCount + " t=" + (nowUs / 1e6).toFixed(1) });
+        }
+        await new Promise(function (r) { setTimeout(r, 0); });
       }
-      const targetUs = now * 1000;
-      while (i + 1 < decodedFrames.length && decodedFrames[i + 1].timestamp <= targetUs) {
-        decodedFrames[i].close();
-        i++;
-      }
-      const f = decodedFrames[i];
-      scratchCtx.drawImage(f, 0, 0, scratch.width, scratch.height);
-      f.close();
-      i++;
-      lastPresent = now;
-      await pushFrameFromCanvas();
-      hud.time.textContent = (now / 1000).toFixed(1) + "s";
+    } finally {
+      while (queue.length) queue.shift().close();
+      try { dec.close(); } catch (_) {}
     }
-    while (i < decodedFrames.length) { decodedFrames[i].close(); i++; }
-    try { videoDecoder.close(); } catch (_) {}
   }
 
   /* ---------- Pack fallback ---------- */
-  async function playViaPack(meta) {
+  async function playViaPack(meta, gen) {
+    if (gen === undefined) gen = playGen;
     if (!meta || !meta.pack) throw new Error("no pack for clip");
     setPath("pack fallback", false);
-    hud.renderer.textContent = "JPEG pack → <img> (no live decode, no <video>)";
+    hud.renderer.textContent = "JPEG pack → <img> (preloaded, no <video>)";
     hud.renderer.style.color = "var(--warn)";
     refreshVideoElHud();
     cwLog("info", "pack_fallback", { msg: "starting pack playback", clip: meta.slug });
 
     setStage("fetch pack manifest…");
-    const manifest = await fetch(meta.pack).then(function (r) {
+    const manifest = await fetch(meta.pack, { cache: "no-store" }).then(function (r) {
       if (!r.ok) throw new Error("pack manifest " + r.status);
       return r.json();
     });
@@ -548,39 +579,92 @@
     const prefix = manifest.frames_prefix || ("/packs/" + meta.slug + "/frames/");
     const fps = manifest.fps || 10;
     const interval = 1000 / fps;
+    const url = function (i) { return prefix + frames[i]; };
+
+    // Preloader: keep up to AHEAD frames decoded in memory (Image objects).
+    // We only ever put an already-loaded URL into the visible <img>, so the
+    // swap is instant and never aborts an in-flight network load.
+    const AHEAD = 20;
+    const ready = new Map();   // index -> true when loaded
+    const loading = new Map(); // index -> Image
+    let nextToLoad = 0;
+    function pump(cur) {
+      while (nextToLoad < frames.length && nextToLoad < cur + AHEAD && loading.size < 6) {
+        const idx = nextToLoad++;
+        if (idx < cur) continue;
+        const im = new Image();
+        loading.set(idx, im);
+        im.onload = function () {
+          loading.delete(idx);
+          const done = function () { ready.set(idx, im); };
+          if (im.decode) im.decode().then(done, done); else done();
+        };
+        im.onerror = function () { loading.delete(idx); cwLog("warn", "error", { msg: "pack frame failed " + idx }); };
+        im.src = url(idx);
+      }
+    }
+
+    setStage("buffering pack…");
+    pump(0);
+    // Wait for the first few frames before starting the clock
+    const bufStart = performance.now();
+    while (!isAborted(gen) && ready.size < Math.min(8, frames.length) && performance.now() - bufStart < 8000) {
+      pump(0);
+      await new Promise(function (r) { setTimeout(r, 30); });
+    }
 
     setStage("fetch pack audio…");
     let audioDone = Promise.resolve();
+    let pcm = null;
     try {
-      const pcm = await fetch(manifest.audio).then(function (r) {
+      pcm = await fetch(manifest.audio).then(function (r) {
         if (!r.ok) throw new Error("pcm " + r.status);
         return r.arrayBuffer();
       });
-      audioDone = playPcmS16le(pcm, manifest.audio_sample_rate || 24000, manifest.audio_channels || 1);
-      hud.audio.textContent = "PCM s16le " + (manifest.audio_sample_rate || 24000) + "Hz";
     } catch (e) {
       cwLog("warn", "error", { msg: "pack audio failed: " + e.message });
       hud.audio.textContent = "none";
     }
+    if (isAborted(gen)) return;
 
     setStage("playing");
-    cwLog("info", "playing", { msg: "pack playing", path: "pack", frames: frames.length });
+    cwLog("info", "playing", { msg: "pack playing", path: "pack", frames: frames.length, buffered: ready.size });
     btnStop.disabled = false;
+    if (pcm) {
+      audioDone = playPcmS16le(pcm, manifest.audio_sample_rate || 24000, manifest.audio_channels || 1);
+      hud.audio.textContent = "PCM s16le " + (manifest.audio_sample_rate || 24000) + "Hz";
+    }
 
     const t0 = performance.now();
-    for (let i = 0; i < frames.length && !stopRequested; i++) {
-      const target = t0 + i * interval;
-      const wait = target - performance.now();
-      if (wait > 0) await new Promise(function (r) { setTimeout(r, wait); });
-      if (i === 0) setStage("first pack frame…");
-      showJpegUrl(prefix + frames[i]);
-      if (i === 0) {
-        setStage("playing");
-        cwLog("info", "stage", { stage: "first pack frame painted" });
+    let shown = -1;
+    let stalls = 0;
+    let lastBeat = performance.now();
+    while (!isAborted(gen)) {
+      const elapsed = performance.now() - t0;
+      const due = Math.min(frames.length - 1, Math.floor(elapsed / interval));
+      pump(Math.max(shown, 0));
+      // newest ready frame <= due, newer than what is shown
+      let pick = -1;
+      for (let k = due; k > shown; k--) { if (ready.has(k)) { pick = k; break; } }
+      if (pick > shown) {
+        if (setImgSrc(url(pick), false)) {
+          for (let k = shown + 1; k <= pick; k++) ready.delete(k);
+          if (shown < 0) cwLog("info", "stage", { stage: "first pack frame painted" });
+          shown = pick;
+        }
+      } else if (due > shown) {
+        stalls++;
       }
-      hud.time.textContent = ((performance.now() - t0) / 1000).toFixed(1) + "s";
+      hud.time.textContent = (elapsed / 1000).toFixed(1) + "s";
+      if (performance.now() - lastBeat > 5000) {
+        lastBeat = performance.now();
+        cwLog("info", "heartbeat", { path: "pack", msg: "due=" + due + " shown=" + shown + " ready=" + ready.size + " loading=" + loading.size + " assigned=" + assignedCount + " painted=" + paintedCount + " stalls=" + stalls });
+      }
+      if (shown >= frames.length - 1 || elapsed > frames.length * interval + 3000) break;
+      await new Promise(function (r) { setTimeout(r, 20); });
     }
-    if (!stopRequested) await audioDone.catch(function () {});
+    loading.forEach(function (im) { im.src = ""; });
+    if (!isAborted(gen)) await audioDone.catch(function () {});
   }
 
   /* ---------- Phone debug video path ---------- */
@@ -674,53 +758,60 @@
 
     try {
       if (usePack && meta && meta.pack) {
-        await playViaPack(meta);
+        await playViaPack(meta, ++playGen);
         return !stopRequested;
       }
 
       if (webCodecsOk && src) {
-        let firstFrameDone = false;
-        const wcPromise = (async function () {
-          // Instrument inner stages; resolve "first frame ready" via race below
-          await playViaWebCodecs(src);
-        })();
+        const wcGen = ++playGen;
+        let fetchedAt = 0;
+        let wcErr = null;
+        let wcDone = false;
+        const wcPromise = playViaWebCodecs(src, wcGen, function () { fetchedAt = Date.now(); })
+          .then(function () { wcDone = true; }, function (e) { wcErr = e; wcDone = true; });
 
-        // Race: either WebCodecs reaches playing (frameCount>0) within timeout, or we abort
+        // Timeout counts from when the MP4 finished downloading (slow LTE
+        // download is not a decoder stall). Hard cap 45s for the download.
         const started = Date.now();
-        while (!stopRequested && frameCount === 0 && (Date.now() - started) < WC_TIMEOUT_MS) {
+        while (!stopRequested && paintedCount === 0 && !wcDone) {
+          const now = Date.now();
+          if (fetchedAt && now - fetchedAt > WC_TIMEOUT_MS) break;
+          if (!fetchedAt && now - started > 45000) break;
           await new Promise(function (r) { setTimeout(r, 100); });
-          if (currentStage && /error|timed out/i.test(currentStage)) break;
         }
 
-        if (frameCount === 0 && !stopRequested) {
-          stopRequested = true; // abort WC loop
-          await Promise.race([wcPromise.catch(function () {}), new Promise(function (r) { setTimeout(r, 200); })]);
-          stopRequested = false;
-          cwLog("warn", "timeout", {
-            msg: "WebCodecs timed out → pack fallback",
-            stage: currentStage,
-            timeoutMs: WC_TIMEOUT_MS,
-            probeSaidYes: webCodecsOk,
-          });
-          cwLog("warn", "pack_fallback", { msg: "after WebCodecs timeout", probeSaidYes: webCodecsOk });
-          setStage("WebCodecs timed out → pack fallback");
-          setPath("pack (after WC timeout)", false);
+        if (paintedCount === 0 && !stopRequested) {
+          playGen++; // kills the WebCodecs attempt (its loops check the gen)
+          if (wcErr) {
+            cwLog("error", "decoder_error", { msg: "WebCodecs failed: " + (wcErr.message || wcErr), probeSaidYes: webCodecsOk });
+          } else {
+            cwLog("warn", "timeout", {
+              msg: "WebCodecs timed out → pack fallback",
+              stage: currentStage,
+              timeoutMs: WC_TIMEOUT_MS,
+              fetched: !!fetchedAt,
+              probeSaidYes: webCodecsOk,
+            });
+          }
+          cwLog("warn", "pack_fallback", { msg: wcErr ? "after WebCodecs error" : "after WebCodecs timeout", probeSaidYes: webCodecsOk });
+          setStage("WebCodecs failed → pack fallback");
+          resetHud();
           if (meta && meta.pack) {
-            await playViaPack(meta);
+            await playViaPack(meta, playGen);
             return !stopRequested;
           }
-          throw new Error("WebCodecs timed out and no pack available");
+          throw wcErr || new Error("WebCodecs timed out and no pack available");
         }
 
-        // First frame appeared — wait for rest of playback
         await wcPromise;
+        if (wcErr) throw wcErr;
         return !stopRequested;
       }
 
       if (meta && meta.pack) {
         cwLog("info", "pack_fallback", { msg: "WebCodecs unavailable — using pack" });
         setStage("WebCodecs unavailable — pack fallback");
-        await playViaPack(meta);
+        await playViaPack(meta, ++playGen);
         return !stopRequested;
       }
 
@@ -738,7 +829,8 @@
         try {
           setStage("error → pack fallback: " + e.message);
           stopAudio();
-          await playViaPack(meta);
+          resetHud();
+          await playViaPack(meta, ++playGen);
           return !stopRequested;
         } catch (e2) {
           cwLog("error", "error", { msg: "pack also failed: " + e2.message });
@@ -839,6 +931,7 @@
 
   function stopPlayback() {
     stopRequested = true;
+    playGen++;
     playlistActive = false;
     try { if (hiddenVideo) hiddenVideo.pause(); } catch (_) {}
     stopAudio();
@@ -897,10 +990,10 @@
       if (e.key === "Enter") selectUrl(urlInput.value.trim());
     });
     btnPlay.addEventListener("click", function () {
-      if (!playing) playSelected({ tryWebCodecs: true, forcePack: FORCE_PACK });
+      if (!playing) playSelected({ tryWebCodecs: TRY_WC, forcePack: FORCE_PACK });
     });
     btnPlayAll.addEventListener("click", function () {
-      if (!playing) playPlaylist({ tryWebCodecs: true, forcePack: false });
+      if (!playing) playPlaylist({ tryWebCodecs: TRY_WC, forcePack: false });
     });
     btnForcePack.addEventListener("click", function () {
       if (!playing) {

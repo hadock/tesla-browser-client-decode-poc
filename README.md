@@ -69,6 +69,8 @@ Auth with short-lived STS from `AWS_POC_CREDENTIALS_JSON` (nested
 ./scripts/deploy.sh            # stack + frontend + videos + invalidate
 ./scripts/deploy.sh frontend   # SPA only
 ./scripts/deploy.sh videos     # MP4s only
+python3 tools/build_chunks.py  # bundle pack frames into 20-frame chunks
+./scripts/deploy.sh packs      # JPEG+PCM packs (frames + chunks)
 ```
 
 Stack name: `tesla-browser-client-decode-poc` · Region: `us-east-1` ·
@@ -106,6 +108,20 @@ Saved Insights queries (created by `scripts/deploy.sh`):
 
 - **tesla-client-decode-car-failures** — timeouts, decoder errors, pack fallbacks, errors
 - **tesla-client-decode-session** — paste `sessionId` from the page HUD into the filter
+- **tesla-client-decode-heartbeat** — pack-player heartbeat trend (every 5s): `lagMs`
+  (picture behind the audio clock), `bufAheadMs`, `loadP50`/`loadP95` per request,
+  `kbps`, `inflight`, `liveImgs`, `liveBlobUrls`, `heapMB`, `rebuffers`, `stallMs`,
+  `loopGapMaxMs`/`longTaskMaxMs` (main-thread blocking)
+
+## Pack player (Drive-safe path)
+
+Pack frames are fetched as multi-frame chunks (`packs/<slug>/chunks/c####.bin`,
+20 JPEGs = 2s per request; byte lengths in `manifest.json`). The fetch window is
+anchored at the playhead and sized from measured p95 load time (4–20s); requests
+that fall behind are aborted. Only ~6 frames are decoded at a time (Image + blob
+URL), and everything behind the playhead is released. The picture follows the
+`AudioContext` clock; if it underruns, audio pauses briefly (rebuffer) instead
+of drifting. `?chunks=0` forces the old one-request-per-frame mode.
 
 Console: CloudWatch → Logs → Insights → select the saved query.
 Car tip: open `?pack=1` or tap **Force pack fallback** first; WebCodecs may probe green but stall.

@@ -180,7 +180,7 @@
   }
 
   function revokeObjectUrl() {
-    if (objectUrl) { URL.revokeObjectURL(objectUrl); objectUrl = null; }
+    if (objectUrl) { rmUrl(objectUrl); objectUrl = null; }
   }
 
   function showAttribution(meta) {
@@ -219,16 +219,22 @@
   // the in-flight load and the picture freezes while counters keep ticking).
   let imgBusy = false;
   let prevObjectUrl = null;
+  // Every blob: URL we create goes through mkUrl/rmUrl so the heartbeat can
+  // report live blob URLs (a leak shows up as a number that only goes up).
+  let liveBlobUrls = 0;
+  function mkUrl(blob) { liveBlobUrls++; return URL.createObjectURL(blob); }
+  function rmUrl(u) { if (u && u.indexOf("blob:") === 0) { liveBlobUrls--; URL.revokeObjectURL(u); } }
   frameEl.decoding = "sync";
   frameEl.addEventListener("load", function () {
     imgBusy = false;
     paintedCount++;
     frameCount = paintedCount;
     tickFps();
-    if (prevObjectUrl) { URL.revokeObjectURL(prevObjectUrl); prevObjectUrl = null; }
+    if (prevObjectUrl) { rmUrl(prevObjectUrl); prevObjectUrl = null; }
   });
   frameEl.addEventListener("error", function () {
     imgBusy = false;
+    if (prevObjectUrl) { rmUrl(prevObjectUrl); prevObjectUrl = null; }
     cwLog("warn", "error", { msg: "img load error " + String(frameEl.src).slice(-40) });
   });
 
@@ -236,7 +242,10 @@
     if (imgBusy) return false;            // drop frame, keep the current picture
     imgBusy = true;
     assignedCount++;
-    if (isObjectUrl) { prevObjectUrl = objectUrl; objectUrl = url; }
+    if (isObjectUrl) {
+      if (prevObjectUrl) rmUrl(prevObjectUrl); // superseded before it ever loaded
+      prevObjectUrl = objectUrl; objectUrl = url;
+    }
     frameEl.src = url;
     return true;
   }
@@ -251,7 +260,7 @@
         scratch.toBlob(function (blob) {
           blobBusy = false;
           if (!blob || (gen !== undefined && isAborted(gen))) { resolve(false); return; }
-          resolve(setImgSrc(URL.createObjectURL(blob), true));
+          resolve(setImgSrc(mkUrl(blob), true));
         }, "image/jpeg", 0.7);
       } else {
         blobBusy = false;
@@ -349,7 +358,11 @@
       let cls = v ? "cap-ok" : "cap-no";
       if (k === "<video> in DOM" || k === "allowVideo flag") cls = v ? "cap-no" : "cap-ok";
       if (k === "preferPack") cls = "cap-ok";
-      div.innerHTML = '<span class="cap-k">' + k + '</span><span class="' + cls + '">' + (v ? "yes" : "no") + "</span>";
+      // textContent, not innerHTML: the label "<video> in DOM" parsed as HTML
+      // used to create a real (empty) <video> element and break the zero-<video> claim.
+      const kEl = document.createElement("span"); kEl.className = "cap-k"; kEl.textContent = k;
+      const vEl = document.createElement("span"); vEl.className = cls; vEl.textContent = v ? "yes" : "no";
+      div.appendChild(kEl); div.appendChild(vEl);
       capsGrid.appendChild(div);
     });
     hud.web.textContent = webCodecsOk ? "yes" : "no";
@@ -560,11 +573,46 @@
   }
 
   /* ---------- Pack fallback ---------- */
+  // Streaming JPEG+PCM player, built for the car's high-latency LTE link:
+  //  * frames come in multi-frame chunks (20 frames = 2s per request) instead
+  //    of one request per frame, so throughput isn't capped by RTT x 6 slots;
+  //  * the fetch window is anchored at the *playhead* (due), sized from the
+  //    measured p95 chunk load time, and requests that fall behind are aborted;
+  //  * only a small bounded ring of frames is decoded (Image + blob URL); every
+  //    frame behind the playhead is released immediately;
+  //  * the picture follows the audio clock (AudioContext.currentTime). If the
+  //    picture underruns we pause audio (rebuffer) instead of drifting apart.
+  const PACK_DECODE_AHEAD = 6;     // decoded <img>-ready frames kept ahead
+  const PACK_MIN_AHEAD_MS = 4000;  // minimum compressed buffer ahead
+  const PACK_MAX_AHEAD_MS = 20000;
+  const PACK_REBUFFER_LAG_MS = 700;   // picture this far behind audio -> pause audio
+  const PACK_RESUME_AHEAD_MS = 2000;  // resume once this much is buffered
+
+  function pctl(arr, p) {
+    if (!arr.length) return 0;
+    const a = arr.slice().sort(function (x, y) { return x - y; });
+    return Math.round(a[Math.min(a.length - 1, Math.floor(p * a.length))]);
+  }
+
+  // Main-thread health: long tasks (where supported) + timer-loop gaps.
+  const perfStats = { longTasks: 0, longTaskMaxMs: 0 };
+  try {
+    if (window.PerformanceObserver && PerformanceObserver.supportedEntryTypes &&
+        PerformanceObserver.supportedEntryTypes.indexOf("longtask") >= 0) {
+      new PerformanceObserver(function (list) {
+        list.getEntries().forEach(function (e) {
+          perfStats.longTasks++;
+          perfStats.longTaskMaxMs = Math.max(perfStats.longTaskMaxMs, Math.round(e.duration));
+        });
+      }).observe({ entryTypes: ["longtask"] });
+    }
+  } catch (_) {}
+
   async function playViaPack(meta, gen) {
     if (gen === undefined) gen = playGen;
     if (!meta || !meta.pack) throw new Error("no pack for clip");
     setPath("pack fallback", false);
-    hud.renderer.textContent = "JPEG pack → <img> (preloaded, no <video>)";
+    hud.renderer.textContent = "JPEG pack → <img> (streamed chunks, no <video>)";
     hud.renderer.style.color = "var(--warn)";
     refreshVideoElHud();
     cwLog("info", "pack_fallback", { msg: "starting pack playback", clip: meta.slug });
@@ -575,95 +623,245 @@
       return r.json();
     });
     const frames = manifest.frames || [];
-    if (!frames.length) throw new Error("empty pack");
+    const N = frames.length;
+    if (!N) throw new Error("empty pack");
     const prefix = manifest.frames_prefix || ("/packs/" + meta.slug + "/frames/");
     const fps = manifest.fps || 10;
     const interval = 1000 / fps;
-    const url = function (i) { return prefix + frames[i]; };
+    const durMs = N * interval;
 
-    // Preloader: keep up to AHEAD frames decoded in memory (Image objects).
-    // We only ever put an already-loaded URL into the visible <img>, so the
-    // swap is instant and never aborts an in-flight network load.
-    const AHEAD = 20;
-    const ready = new Map();   // index -> true when loaded
-    const loading = new Map(); // index -> Image
-    let nextToLoad = 0;
-    function pump(cur) {
-      while (nextToLoad < frames.length && nextToLoad < cur + AHEAD && loading.size < 6) {
-        const idx = nextToLoad++;
-        if (idx < cur) continue;
-        const im = new Image();
-        loading.set(idx, im);
-        im.onload = function () {
-          loading.delete(idx);
-          const done = function () { ready.set(idx, im); };
-          if (im.decode) im.decode().then(done, done); else done();
-        };
-        im.onerror = function () { loading.delete(idx); cwLog("warn", "error", { msg: "pack frame failed " + idx }); };
-        im.src = url(idx);
+    // Fetch units: a chunk of frames, or a single frame (?chunks=0 / old packs).
+    const useChunks = !!(manifest.chunks && manifest.chunks.length) && params.get("chunks") !== "0";
+    const units = useChunks
+      ? manifest.chunks.map(function (c) { return { url: (manifest.chunks_prefix || ("/packs/" + meta.slug + "/chunks/")) + c.file, first: c.first, lengths: c.lengths, count: c.lengths.length }; })
+      : frames.map(function (f, i) { return { url: prefix + f, first: i, lengths: null, count: 1 }; });
+    const unitOfFrame = new Int32Array(N);
+    units.forEach(function (u, ui) { for (let k = 0; k < u.count; k++) unitOfFrame[u.first + k] = ui; });
+    const MAX_INFLIGHT = useChunks ? 3 : 6;
+
+    const blobs = new Map();     // frame -> compressed Blob (cheap)
+    const ring = new Map();      // frame -> { url, img, ok } decoded window (bounded)
+    const inflight = new Map();  // unit -> AbortController
+    const fetched = new Set();   // units already delivered
+    const loadMs = [];           // last 30 request times
+    let bytesIn = 0, bytesSinceBeat = 0, fetchErrors = 0, aborted = 0;
+    let due = 0, shown = -1;
+    let decoding = 0;
+
+    function aheadTargetMs() {
+      const p95 = pctl(loadMs, 0.95) || 1000;
+      // enough buffered to ride out ~3 slow requests back to back
+      return Math.max(PACK_MIN_AHEAD_MS, Math.min(PACK_MAX_AHEAD_MS, p95 * 3 + 1000));
+    }
+    function contiguousAhead() {        // frames buffered contiguously from due
+      let k = Math.max(due, shown + 1);
+      while (k < N && (blobs.has(k) || ring.has(k))) k++;
+      return k - due;
+    }
+
+    function fetchUnit(ui) {
+      const u = units[ui];
+      const ac = window.AbortController ? new AbortController() : null;
+      inflight.set(ui, ac);
+      const t = performance.now();
+      fetch(u.url, ac ? { signal: ac.signal } : {}).then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.arrayBuffer();
+      }).then(function (ab) {
+        inflight.delete(ui);
+        if (isAborted(gen)) return;
+        fetched.add(ui);
+        loadMs.push(performance.now() - t); if (loadMs.length > 30) loadMs.shift();
+        bytesIn += ab.byteLength; bytesSinceBeat += ab.byteLength;
+        if (!u.lengths) { if (u.first > shown) blobs.set(u.first, new Blob([ab], { type: "image/jpeg" })); return; }
+        let off = 0;
+        for (let k = 0; k < u.count; k++) {
+          const len = u.lengths[k], idx = u.first + k;
+          if (idx > shown && idx >= due - 1) blobs.set(idx, new Blob([new Uint8Array(ab, off, len)], { type: "image/jpeg" }));
+          off += len;
+        }
+      }).catch(function (e) {
+        inflight.delete(ui);
+        if (e && e.name === "AbortError") return;
+        fetchErrors++;
+        cwLog("warn", "error", { msg: "pack fetch failed unit " + ui + ": " + (e && e.message) });
+      });
+    }
+
+    function schedule() {
+      const curUnit = unitOfFrame[Math.min(due, N - 1)];
+      // abort requests that can no longer arrive in time to be shown
+      inflight.forEach(function (ac, ui) {
+        const u = units[ui];
+        if (u.first + u.count - 1 < due) { if (ac) ac.abort(); inflight.delete(ui); aborted++; }
+      });
+      const limitFrame = Math.min(N - 1, due + Math.ceil(aheadTargetMs() / interval));
+      for (let ui = curUnit; ui < units.length && inflight.size < MAX_INFLIGHT; ui++) {
+        if (units[ui].first > limitFrame) break;
+        if (fetched.has(ui) || inflight.has(ui)) continue;
+        fetchUnit(ui);
+      }
+    }
+
+    function release() {           // drop everything at/behind the shown frame
+      blobs.forEach(function (_, k) { if (k <= shown) blobs.delete(k); });
+      ring.forEach(function (e, k) {
+        if (k <= shown || k > due + PACK_DECODE_AHEAD * 3) { rmUrl(e.url); e.img.src = ""; ring.delete(k); }
+      });
+    }
+
+    function decodeAhead() {
+      for (let k = Math.max(due, shown + 1); k < Math.min(N, due + PACK_DECODE_AHEAD) && decoding < 2; k++) {
+        if (ring.has(k) || !blobs.has(k)) continue;
+        const blob = blobs.get(k); blobs.delete(k);
+        const e = { url: mkUrl(blob), img: new Image(), ok: false };
+        ring.set(k, e);
+        decoding++;
+        const done = function () { decoding--; e.ok = true; };
+        e.img.onload = function () { if (e.img.decode) e.img.decode().then(done, done); else done(); };
+        e.img.onerror = function () { decoding--; e.ok = true; e.bad = true; };
+        e.img.src = e.url;
       }
     }
 
     setStage("buffering pack…");
-    pump(0);
-    // Wait for the first few frames before starting the clock
+    // Pre-roll: start the audio fetch in parallel with the first frames.
+    const pcmP = fetch(manifest.audio).then(function (r) {
+      if (!r.ok) throw new Error("pcm " + r.status);
+      return r.arrayBuffer();
+    });
     const bufStart = performance.now();
-    while (!isAborted(gen) && ready.size < Math.min(8, frames.length) && performance.now() - bufStart < 8000) {
-      pump(0);
+    const preroll = Math.min(N, Math.ceil(PACK_RESUME_AHEAD_MS / interval));
+    while (!isAborted(gen) && contiguousAhead() < preroll && performance.now() - bufStart < 15000) {
+      schedule(); decodeAhead();
       await new Promise(function (r) { setTimeout(r, 30); });
     }
 
     setStage("fetch pack audio…");
-    let audioDone = Promise.resolve();
     let pcm = null;
-    try {
-      pcm = await fetch(manifest.audio).then(function (r) {
-        if (!r.ok) throw new Error("pcm " + r.status);
-        return r.arrayBuffer();
-      });
-    } catch (e) {
+    try { pcm = await pcmP; } catch (e) {
       cwLog("warn", "error", { msg: "pack audio failed: " + e.message });
       hud.audio.textContent = "none";
     }
-    if (isAborted(gen)) return;
+    if (isAborted(gen)) { ring.forEach(function (e) { rmUrl(e.url); }); return; }
 
     setStage("playing");
-    cwLog("info", "playing", { msg: "pack playing", path: "pack", frames: frames.length, buffered: ready.size });
+    cwLog("info", "playing", { msg: "pack playing", path: "pack", frames: N, chunks: useChunks ? units.length : 0, buffered: contiguousAhead(), prerollMs: Math.round(performance.now() - bufStart) });
     btnStop.disabled = false;
+
+    // Master clock: audio when we have it, wall clock otherwise.
+    let audioDone = Promise.resolve();
+    let audioEnded = false;
+    let ctx = null, a0 = 0;
     if (pcm) {
       audioDone = playPcmS16le(pcm, manifest.audio_sample_rate || 24000, manifest.audio_channels || 1);
+      audioDone.then(function () { audioEnded = true; });
+      ctx = audioCtx; a0 = ctx.currentTime;
       hud.audio.textContent = "PCM s16le " + (manifest.audio_sample_rate || 24000) + "Hz";
     }
-
-    const t0 = performance.now();
-    let shown = -1;
-    let stalls = 0;
-    let lastBeat = performance.now();
-    while (!isAborted(gen)) {
-      const elapsed = performance.now() - t0;
-      const due = Math.min(frames.length - 1, Math.floor(elapsed / interval));
-      pump(Math.max(shown, 0));
-      // newest ready frame <= due, newer than what is shown
-      let pick = -1;
-      for (let k = due; k > shown; k--) { if (ready.has(k)) { pick = k; break; } }
-      if (pick > shown) {
-        if (setImgSrc(url(pick), false)) {
-          for (let k = shown + 1; k <= pick; k++) ready.delete(k);
-          if (shown < 0) cwLog("info", "stage", { stage: "first pack frame painted" });
-          shown = pick;
-        }
-      } else if (due > shown) {
-        stalls++;
+    pcm = null;
+    let wall0 = performance.now(), pausedMs = 0, lastT = 0, inRebuffer = false, clockSrc = ctx ? "audio" : "wall";
+    function clockMs() {
+      if (ctx && !audioEnded && !(ctx.state !== "running" && !inRebuffer && performance.now() - wall0 > 1500)) {
+        lastT = (ctx.currentTime - a0) * 1000;
+        return lastT;
       }
-      hud.time.textContent = (elapsed / 1000).toFixed(1) + "s";
-      if (performance.now() - lastBeat > 5000) {
-        lastBeat = performance.now();
-        cwLog("info", "heartbeat", { path: "pack", msg: "due=" + due + " shown=" + shown + " ready=" + ready.size + " loading=" + loading.size + " assigned=" + assignedCount + " painted=" + paintedCount + " stalls=" + stalls });
+      if (ctx) {                       // audio blocked/ended -> continue on wall clock
+        cwLog("warn", "clock", { msg: "audio clock unavailable (" + (audioEnded ? "ended" : ctx.state) + ") -> wall clock at " + Math.round(lastT) + "ms" });
+        ctx = null; wall0 = performance.now() - lastT; pausedMs = 0; clockSrc = "wall";
       }
-      if (shown >= frames.length - 1 || elapsed > frames.length * interval + 3000) break;
-      await new Promise(function (r) { setTimeout(r, 20); });
+      lastT = performance.now() - wall0 - pausedMs;
+      return lastT;
     }
-    loading.forEach(function (im) { im.src = ""; });
+
+    let stallMs = 0, rebuffers = 0, rebufferMs = 0, maxLagMs = 0, loopGapMaxMs = 0;
+    let lastLoop = performance.now(), lastBeat = performance.now();
+    let lastBeatPainted = paintedCount;
+    try {
+      while (!isAborted(gen)) {
+        const now = performance.now();
+        const gap = now - lastLoop; lastLoop = now;
+        if (gap > loopGapMaxMs) loopGapMaxMs = gap;
+        const t = clockMs();
+        due = Math.min(N - 1, Math.max(0, Math.floor(t / interval)));
+        release(); schedule(); decodeAhead();
+
+        // newest decoded frame <= due, newer than what is shown
+        let pick = -1;
+        for (let k = due; k > shown; k--) { const e = ring.get(k); if (e && e.ok && !e.bad) { pick = k; break; } }
+        if (pick > shown && !imgBusy) {
+          const e = ring.get(pick);
+          ring.delete(pick);                  // ownership -> visible <img>
+          if (setImgSrc(e.url, true)) {
+            if (shown < 0) cwLog("info", "stage", { stage: "first pack frame painted" });
+            shown = pick;
+            e.img.src = "";
+          }
+        } else if (due > shown + 1) {
+          stallMs += gap;
+        }
+        const lagMs = Math.max(0, (due - Math.max(shown, 0)) * interval);
+        if (lagMs > maxLagMs) maxLagMs = lagMs;
+
+        // Rebuffer: picture starved behind the audio clock -> pause the clock.
+        if (lagMs > PACK_REBUFFER_LAG_MS && contiguousAhead() < 2 && t < durMs - 1000) {
+          rebuffers++;
+          inRebuffer = true;
+          const r0 = performance.now();
+          setStage("rebuffering…");
+          if (ctx && !audioEnded) { try { await ctx.suspend(); } catch (_) {} }
+          // jump to the newest frame we can get; resume once 2s are buffered
+          while (!isAborted(gen) && contiguousAhead() * interval < PACK_RESUME_AHEAD_MS && performance.now() - r0 < 8000) {
+            schedule(); decodeAhead();
+            await new Promise(function (r) { setTimeout(r, 50); });
+          }
+          const d = performance.now() - r0;
+          rebufferMs += d; pausedMs += d;
+          if (ctx && !audioEnded) { try { await ctx.resume(); } catch (_) {} }
+          inRebuffer = false;
+          setStage("playing");
+          cwLog("info", "rebuffer", { msg: "rebuffered " + Math.round(d) + "ms at frame " + due, durMs: Math.round(d), frame: due });
+          lastLoop = performance.now();
+          continue;
+        }
+
+        hud.time.textContent = (t / 1000).toFixed(1) + "s";
+        if (now - lastBeat > 5000) {
+          const beatMs = now - lastBeat;
+          lastBeat = now;
+          const mem = performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : null;
+          const hb = {
+            path: "pack", due: due, shown: shown,
+            lagMs: Math.round(lagMs), maxLagMs: Math.round(maxLagMs),
+            bufAheadMs: Math.round(contiguousAhead() * interval),
+            aheadTargetMs: Math.round(aheadTargetMs()),
+            decodedAhead: ring.size, blobsHeld: blobs.size, liveImgs: ring.size + 1,
+            liveBlobUrls: liveBlobUrls, inflight: inflight.size,
+            loadP50: pctl(loadMs, 0.5), loadP95: pctl(loadMs, 0.95),
+            kbps: Math.round(bytesSinceBeat * 8 / beatMs),
+            paintFps: Math.round((paintedCount - lastBeatPainted) * 10000 / beatMs) / 10,
+            stallMs: Math.round(stallMs), rebuffers: rebuffers, rebufferMs: Math.round(rebufferMs),
+            fetchErrors: fetchErrors, aborted: aborted,
+            loopGapMaxMs: Math.round(loopGapMaxMs), longTasks: perfStats.longTasks, longTaskMaxMs: perfStats.longTaskMaxMs,
+            heapMB: mem, chunks: useChunks ? 1 : 0, clock: clockSrc
+          };
+          hb.msg = "due=" + due + " shown=" + shown + " lag=" + hb.lagMs + "ms buf=" + hb.bufAheadMs + "ms fps=" + hb.paintFps +
+            " p50/p95=" + hb.loadP50 + "/" + hb.loadP95 + "ms inflight=" + hb.inflight + " imgs=" + hb.liveImgs +
+            " urls=" + liveBlobUrls + " heap=" + mem + "MB rebuf=" + rebuffers + " stallMs=" + hb.stallMs + " gapMax=" + hb.loopGapMaxMs;
+          cwLog("info", "heartbeat", hb);
+          bytesSinceBeat = 0; lastBeatPainted = paintedCount; maxLagMs = 0; loopGapMaxMs = 0; perfStats.longTaskMaxMs = 0;
+        }
+        if (shown >= N - 1 || t > durMs + 3000) break;
+        await new Promise(function (r) { setTimeout(r, 20); });
+      }
+    } finally {
+      inflight.forEach(function (ac) { if (ac) ac.abort(); });
+      inflight.clear();
+      ring.forEach(function (e) { rmUrl(e.url); e.img.src = ""; });
+      ring.clear(); blobs.clear();
+      if (ctx && ctx.state === "suspended") { try { ctx.resume(); } catch (_) {} }
+    }
+    cwLog("info", "pack_done", { msg: "clip done", clip: meta.slug, shown: shown, frames: N, rebuffers: rebuffers, rebufferMs: Math.round(rebufferMs), stallMs: Math.round(stallMs), fetchErrors: fetchErrors, aborted: aborted, kB: Math.round(bytesIn / 1024), loadP50: pctl(loadMs, 0.5), loadP95: pctl(loadMs, 0.95), liveBlobUrls: liveBlobUrls });
     if (!isAborted(gen)) await audioDone.catch(function () {});
   }
 

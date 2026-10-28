@@ -10,6 +10,7 @@ MODE="${1:-all}"
 LOG_GROUP_NAME="/${STACK}/browser"
 QUERY_FAIL_NAME="tesla-client-decode-car-failures"
 QUERY_SESSION_NAME="tesla-client-decode-session"
+QUERY_HB_NAME="tesla-client-decode-heartbeat"
 
 need() { command -v "$1" >/dev/null || { echo "missing: $1" >&2; exit 1; }; }
 need aws
@@ -122,6 +123,11 @@ upload_packs() {
     frames="$slug_dir/frames"
     aws s3 sync "$frames/" "s3://$bucket/packs/$slug/frames/" \
       --content-type "image/jpeg" --cache-control "public,max-age=86400" --region "$REGION"
+    if [[ -d "$slug_dir/chunks" ]]; then
+      # multi-frame chunks (tools/build_chunks.py): ~35 requests/clip instead of 700
+      aws s3 sync "$slug_dir/chunks/" "s3://$bucket/packs/$slug/chunks/" --delete \
+        --content-type "application/octet-stream" --cache-control "public,max-age=86400" --region "$REGION"
+    fi
   done
 }
 
@@ -182,7 +188,7 @@ ensure_queries() {
   local fail_query session_query
   fail_query=$(cat <<'Q'
 fields @timestamp, sessionId, event, stage, path, clip, msg, level
-| filter event in ["timeout", "decoder_error", "pack_fallback", "error"] or level = "error" or stage like /fail|timeout|error/
+| filter event in ["timeout", "decoder_error", "pack_fallback", "error", "rebuffer", "clock"] or level = "error" or stage like /fail|timeout|error/
 | sort @timestamp desc
 | limit 200
 Q
@@ -194,6 +200,16 @@ fields @timestamp, sessionId, event, stage, path, clip, msg, level, ua
 | limit 500
 Q
 )
+  local hb_query
+  hb_query=$(cat <<'Q'
+fields @timestamp, sessionId, clip, due, shown, lagMs, maxLagMs, bufAheadMs, aheadTargetMs, paintFps, loadP50, loadP95, kbps, inflight, liveImgs, liveBlobUrls, heapMB, rebuffers, rebufferMs, stallMs, loopGapMaxMs, longTaskMaxMs, clock
+| filter event = "heartbeat" and path = "pack"
+| sort @timestamp asc
+| limit 1000
+Q
+)
+  put_query "$QUERY_HB_NAME" "$hb_query" \
+    "Pack player heartbeat trend: lag / buffer depth / load p50,p95 / live images + blob URLs / heap / rebuffers (add | filter sessionId = ... to narrow)"
   put_query "$QUERY_FAIL_NAME" "$fail_query" \
     "Car decode failure patterns (timeout / decoder_error / pack_fallback / error)"
   put_query "$QUERY_SESSION_NAME" "$session_query" \

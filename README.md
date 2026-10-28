@@ -1,46 +1,48 @@
 # Tesla Browser — Client Decode PoC
 
-**Private. Responsible disclosure only.** Companion to
+> **Disclaimer.** This is a proof of concept for **security research and
+> testing only**. It is **not for use while driving**: test with the vehicle
+> parked, or with a passenger operating the browser and filming. It is
+> provided **as-is, without warranty of any kind**. Responsibility for any
+> use lies entirely with the person who deploys or uses it. See
+> [LICENSE](LICENSE) and [DISCLOSURE.md](DISCLOSURE.md).
+
+**Responsible disclosure only.** Companion to the server-streamed variant,
 [`tesla-browser-media-bypass-poc`](https://github.com/hadock/tesla-browser-media-bypass-poc).
 
-This PoC proves the same Drive-mode media-playback gap **entirely in the
-browser**: a page loads an MP4, decodes it client-side, and renders JPEG
-frames into an `<img>` (or canvas) while playing PCM through the Web Audio
-API. A `<video>` element is never shown. No Lambda, no WebSocket streamer.
+This PoC shows the Drive-mode media-playback gap **entirely in the browser**:
+the page renders JPEG frames into an `<img>` while playing PCM through the
+Web Audio API. By default no `<video>` element is ever created (the hidden
+`<video>` decode path only exists behind `?allowVideo=1`).
 
 ## Why this exists
 
-Tesla's in-car browser blocks HTML5 `<video>` (and equivalent media elements)
-while the vehicle is in Drive. That control does **not** extend to:
+Tesla's in-car browser blocks HTML5 `<video>` (and equivalent media
+elements) while the vehicle is in Drive. That control does **not** extend to:
 
 1. Rapidly swapping the `src` of an `<img>` with sequential JPEG frames
    (or redrawing a `<canvas>`), and
 2. Playing PCM audio through the Web Audio API.
 
-The sibling PoC streams pre-extracted frames over WSS from Lambda. This PoC
-shows the same end state with **no server-side streamer** — just a static
-site that hosts the source MP4s same-origin and does the decode in the page.
+The sibling PoC streams frames over WSS from Lambda. This one needs only a
+static host plus an optional log endpoint.
 
 ## Architecture
 
 ```
-CloudFront (single distribution, HTTPS)
-  /              → SPA (index.html, app.js, …)
-  /videos/*.mp4  → H.264/AAC source clips (~70s)
-         │ same-origin fetch (no CORS)
+Static host (Cloudflare Worker + Static Assets, or AWS CloudFront + S3)
+  /                       SPA (index.html, app.js, styles.css, catalog.json)
+  /packs/<slug>/...       JPEG frame packs (20-frame chunks) + PCM audio   ← default player
+  /videos/<slug>.mp4      H.264/AAC source clips (byte-range capable)      ← WebCodecs path
+  POST /api/logs          browser debug logs → Workers Logs | CloudWatch Logs
+         │ same-origin (no CORS)
          ▼
 Browser (Tesla in-car / desktop)
-  Prefer:  WebCodecs VideoDecoder → canvas → JPEG <img>
-  Fallback: hidden <video> → canvas.drawImage → JPEG <img>
-  Audio: Web Audio API (decodeAudioData) — element stays muted
+  Default:  pack player → <img> + Web Audio (audio clock drives the picture)
+  Optional: WebCodecs VideoDecoder → canvas → JPEG <img>
 ```
 
-Same-origin `/videos/*` via the shared CloudFront distribution means the
-page can `fetch()` and decode the MP4 without CORS headaches. External
-paste-URL input is provided for completeness; those only work when the
-remote origin allows CORS.
-
-## Hosted clips (CC BY 3.0)
+## Hosted clips (CC BY 3.0 — not MIT)
 
 | Slug | Artist — Title | Segment |
 |------|----------------|---------|
@@ -49,69 +51,93 @@ remote origin allows CORS.
 | `spencerx` | Spencer X — Be Somebody (beatbox) | 15–85s |
 | `decadentes` | Los Auténticos Decadentes — Yo No Soy Tu Prisionero (live) | 30–100s |
 
-Attribution is shown under the player. Full license:
-https://creativecommons.org/licenses/by/3.0/
+The media clips (and the frame packs / PCM derived from them) are licensed
+under their own **Creative Commons Attribution 3.0** licenses
+(https://creativecommons.org/licenses/by/3.0/), **not** under the MIT license
+that covers this repository's code. Per-clip attribution, license URL and
+source are in `frontend/catalog.json` and shown under the player. Keep that
+attribution if you redistribute them.
+
+## Deploy (choose the target at deploy time)
+
+One script, two targets. Nothing account-specific is committed: account,
+domain, stack/worker names and log destinations come from env vars, flags, or
+an untracked env file (`.deploy.env.local`, gitignored — see
+`.deploy.env.example`).
+
+```bash
+./deploy.sh --help
+./deploy.sh cloudflare [all|build|config|dry-run] [--worker-name N] [--custom-domain HOST] [--account-id ID]
+./deploy.sh aws [all|stack|frontend|videos|packs|lambda|queries|invalidate|validate|dry-run] \
+               [--stack N] [--region R] [--profile P] [--log-group G] [--bucket-prefix X] [--expected-account ID]
+TARGET=cloudflare ./deploy.sh          # same thing via env
+```
+
+Prerequisites: local `media/*.mp4` and `packs/<slug>/` (build chunks with
+`python3 tools/build_chunks.py`). Both are gitignored.
+
+### Cloudflare (recommended: no AWS resources)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `CLOUDFLARE_ACCOUNT_ID` | — | Optional. Otherwise the account from `npx wrangler login` (or `CLOUDFLARE_API_TOKEN`). |
+| `WORKER_NAME` | `tesla-client-decode-poc` | Worker script name. |
+| `CUSTOM_DOMAIN` | — | Optional, e.g. `poc.example.com` (zone must be on the same account). Unset → `https://<WORKER_NAME>.<your-subdomain>.workers.dev`. |
+
+`cloudflare/wrangler.jsonc` is **generated** from the committed
+`cloudflare/wrangler.template.jsonc` on every deploy and is gitignored.
+A custom domain is attached as a Worker Custom Domain: Cloudflare creates that
+one DNS record and certificate; no other record is touched.
+
+| Path | Served by |
+| --- | --- |
+| `/`, `/app.js`, `/catalog.json`, `/vendor/*`, `/packs/**` | Workers Static Assets |
+| `/videos/<slug>.mp4` | Worker → Static Assets, with byte-range support (`206`/`416`) |
+| `POST /api/logs` | Worker → Workers Logs (one structured JSON entry per browser log line) |
+
+Reading logs: Dashboard → **Workers & Pages → `<WORKER_NAME>` → Observability → Logs**,
+filter `sessionId = <id shown in the page's Debug panel>`; or live:
+`cd cloudflare && npx wrangler tail <WORKER_NAME> --format pretty --search <sessionId>`.
+
+### AWS (CloudFront + S3 + API Gateway + Lambda + CloudWatch)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `AWS_PROFILE` / `AWS_REGION` | standard AWS chain / `us-east-1` | Any standard AWS credential source works. |
+| `STACK_NAME` | `tesla-browser-client-decode-poc` | CloudFormation stack and resource name prefix. |
+| `LOG_GROUP_NAME` | `/<STACK_NAME>/browser` | CloudWatch log group for browser logs. |
+| `BUCKET_PREFIX` | — | Optional; bucket becomes `<prefix>-<STACK_NAME>`. Unset → CloudFormation-generated name. |
+| `EXPECTED_AWS_ACCOUNT` | — | Optional safety guard: refuse to deploy to any other account. |
+| `QUERY_PREFIX` | `tesla-client-decode` | Name prefix for the saved Logs Insights queries. |
+
+`./deploy.sh aws validate` only validates the template; `./deploy.sh aws dry-run`
+creates a CloudFormation change set without executing it. Saved query IDs and
+the generated `config.js` are written to `.deploy/` (gitignored). The site URL
+is the CloudFront domain printed at the end (`https://<your-deployment>`).
+
+Saved Logs Insights queries: `<prefix>-car-failures` (timeouts, decoder
+errors, pack fallbacks, errors), `<prefix>-session` (paste a `sessionId`),
+`<prefix>-heartbeat` (pack-player trend: `lagMs`, `bufAheadMs`,
+`loadP50`/`loadP95`, `kbps`, `inflight`, `liveImgs`, `heapMB`, `rebuffers`,
+`stallMs`, `loopGapMaxMs`/`longTaskMaxMs`).
 
 ## Try it
 
-1. Open the CloudFront URL (printed by `scripts/deploy.sh`).
-2. Pick a hosted clip (or paste a CORS-enabled MP4 URL).
-3. Hit **Play**. Confirm the HUD shows `Renderer: … JPEG <img> (not <video>)`.
-4. In the car: park, open the URL, shift to **Drive**, Play. Baseline a
-   normal `<video>` page first so the contrast is clear.
-
-## Deploy
-
-Auth with short-lived STS from `AWS_POC_CREDENTIALS_JSON` (nested
-`credentials` shape), then:
-
-```bash
-./scripts/deploy.sh            # stack + frontend + videos + invalidate
-./scripts/deploy.sh frontend   # SPA only
-./scripts/deploy.sh videos     # MP4s only
-python3 tools/build_chunks.py  # bundle pack frames into 20-frame chunks
-./scripts/deploy.sh packs      # JPEG+PCM packs (frames + chunks)
-```
-
-Stack name: `tesla-browser-client-decode-poc` · Region: `us-east-1` ·
-Account: `<AWS_ACCOUNT_ID>`.
+1. Open `https://<your-deployment>/`.
+2. Tap a clip in the playlist (tap the player to pause / resume). **Play all**
+   auto-advances. `?pack=1` autostarts the pack player.
+3. Open **Debug** under the player: the HUD shows `Renderer: JPEG pack → <img>`,
+   `<video> in DOM: 0`, and the session id used in the logs.
+4. In the car — **parked, or with a passenger filming**: baseline a normal
+   `<video>` page first, then load the PoC and shift to Drive.
 
 ## Local smoke test
 
 ```bash
 cd frontend
-ln -sfn ../media videos
-python3 -m http.server 8080
-# open http://127.0.0.1:8080/
+ln -sfn ../media videos && ln -sfn ../packs packs
+python3 -m http.server 8080      # http://127.0.0.1:8080/  (POST /api/logs will 501 locally)
 ```
-
-## Repo layout
-
-```
-frontend/     SPA (index.html, app.js, styles.css, catalog.json, vendor/mp4box)
-media/        Source ~70s H.264/AAC MP4s (uploaded to /videos/)
-infra/        CloudFormation (S3 + CloudFront OAC)
-scripts/      deploy.sh
-DISCLOSURE.md Bugcrowd framing
-```
-
-## Security / disclosure
-
-See `DISCLOSURE.md` and `SECURITY.md`. This is intentional, minimal, and
-not a consumer product. Invite only Tesla / Bugcrowd reviewers.
-
-## CloudWatch browser logs
-
-Same-origin `POST /api/logs` ships structured JSON lines (`level`, `event`, `stage`, `path`, `clip`, `sessionId`, `ua`, `msg`) into log group `/tesla-browser-client-decode-poc/browser`.
-
-Saved Insights queries (created by `scripts/deploy.sh`):
-
-- **tesla-client-decode-car-failures** — timeouts, decoder errors, pack fallbacks, errors
-- **tesla-client-decode-session** — paste `sessionId` from the page HUD into the filter
-- **tesla-client-decode-heartbeat** — pack-player heartbeat trend (every 5s): `lagMs`
-  (picture behind the audio clock), `bufAheadMs`, `loadP50`/`loadP95` per request,
-  `kbps`, `inflight`, `liveImgs`, `liveBlobUrls`, `heapMB`, `rebuffers`, `stallMs`,
-  `loopGapMaxMs`/`longTaskMaxMs` (main-thread blocking)
 
 ## Pack player (Drive-safe path)
 
@@ -121,34 +147,29 @@ anchored at the playhead and sized from measured p95 load time (4–20s); reques
 that fall behind are aborted. Only ~6 frames are decoded at a time (Image + blob
 URL), and everything behind the playhead is released. The picture follows the
 `AudioContext` clock; if it underruns, audio pauses briefly (rebuffer) instead
-of drifting. `?chunks=0` forces the old one-request-per-frame mode.
+of drifting. `?chunks=0` forces one request per frame.
 
-Console: CloudWatch → Logs → Insights → select the saved query.
-Car tip: open `?pack=1` or tap **Force pack fallback** first; WebCodecs may probe green but stall.
+## Repo layout
 
-## Cloudflare hosting (primary): https://<your-deployment>
-
-Everything is served same-origin by one Cloudflare Worker, `tesla-client-decode-poc` — nothing on AWS:
-
-| Path | Served by |
-| --- | --- |
-| `/`, `/app.js`, `/catalog.json`, `/vendor/*` | Workers Static Assets |
-| `/packs/<slug>/manifest.json`, `chunks/*.bin`, `frames/*.jpg`, `audio.pcm` | Workers Static Assets (cached 1 day) |
-| `/videos/<slug>.mp4` | Worker → Static Assets, with byte-range support (`206`/`416`) |
-| `POST /api/logs` | Worker → Workers Logs (one structured JSON entry per browser log line) |
-
-Files: `cloudflare/wrangler.jsonc`, `cloudflare/src/worker.js`, `cloudflare/build.sh`.
-
-```bash
-# needs local media/*.mp4 and packs/<slug>/ (see tools/build_chunks.py)
-npx wrangler login            # once
-cloudflare/build.sh deploy    # builds cloudflare/dist and runs wrangler deploy
+```
+deploy.sh                    single entry point: ./deploy.sh <aws|cloudflare>
+scripts/deploy-aws.sh        AWS target (CloudFormation + S3 + Lambda + Insights queries)
+scripts/deploy-cloudflare.sh Cloudflare target (build dist + generate wrangler config + deploy)
+cloudflare/                  Worker (src/worker.js) + wrangler.template.jsonc
+infra/template.yaml          CloudFormation (S3 + CloudFront OAC + HTTP API + Lambda + log group)
+backend/logs/handler.py      Lambda: POST /api/logs → CloudWatch Logs
+frontend/                    SPA (index.html, app.js, styles.css, catalog.json, vendor/mp4box)
+tools/                       build_chunks.py (frame packs), gen_wrangler.py
+media/, packs/               local source clips and frame packs (gitignored)
 ```
 
-`<your-deployment>` is a Worker **Custom Domain** (Cloudflare creates the DNS record and certificate). No other record or Worker on the zone is touched.
+## License
 
-### Reading car logs
-* Dashboard: **Workers & Pages → tesla-client-decode-poc → Observability → Logs**. Filter `sessionId = <id shown on the page>`; useful filters: `event = heartbeat`, `event = pack_fallback`, `level = error`.
-* Live: `cd cloudflare && npx wrangler tail tesla-client-decode-poc --format pretty --search <sessionId>`
+Code: [MIT](LICENSE), Copyright (c) 2026 Sergio Barraza. The media clips and
+derived packs are **not** MIT — they remain under their CC BY 3.0 licenses
+(see above). `frontend/vendor/mp4box.all.min.js` is MP4Box.js (BSD-3-Clause).
 
-Each entry carries the original fields (`ts`, `level`, `event`, `msg`, `sessionId`, …) plus `source`, `colo`, `country`, `ua`.
+## Security / disclosure
+
+See `DISCLOSURE.md` and `SECURITY.md`. Intentional, minimal, not a consumer
+product.

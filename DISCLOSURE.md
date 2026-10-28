@@ -7,6 +7,13 @@
 **PoC repository:** https://github.com/hadock/tesla-browser-client-decode-poc (private — invite Tesla/Bugcrowd only)
 **Sibling PoC (server-streamed frames):** https://github.com/hadock/tesla-browser-media-bypass-poc
 **Status:** Ready for submission — PoC is intentional, minimal, and not a consumer product
+**License:** code MIT (see `LICENSE`); media clips CC BY 3.0 (their own licenses, not MIT)
+
+> **Disclaimer.** This is a proof of concept for **security research and
+> testing only** and is **not for use while driving**. Reproduce with the
+> vehicle parked, or with a passenger operating the browser and filming.
+> Provided **as-is, without warranty of any kind**. Responsibility for any use
+> lies entirely with the person who deploys or uses it.
 
 ---
 
@@ -21,8 +28,8 @@ playback while the vehicle is in Drive. That control does **not** extend to:
 
 This repository is a short, self-contained proof that the gap can be exploited
 **entirely client-side**: the page loads an MP4 from the same origin, decodes
-it in the browser (WebCodecs when available, otherwise a hidden `<video>`
-drawn to canvas), and presents the result as JPEG frames in an `<img>` plus
+it in the browser (WebCodecs when available; by default a pre-built JPEG
+frame pack, so no `<video>` element is ever created), and presents the result as JPEG frames in an `<img>` plus
 Web Audio PCM. No `<video>` element is ever shown to the user. No Lambda /
 WebSocket streamer is required.
 
@@ -53,14 +60,14 @@ submission time (Controls → Software).
 
 1. Park. Open a normal HTML5 video page in the in-car browser; confirm it
    does **not** play in Drive (control baseline).
-2. Open the hosted PoC URL (CloudFront distribution from this repo).
-3. Pick a hosted clip → **Play**.
-4. Shift to **Drive**. Observe: frames advance in the `<img>`, audio is
+2. Deploy with `./deploy.sh cloudflare` or `./deploy.sh aws` (see README) and
+   open `https://<your-deployment>/`.
+3. Tap a clip in the playlist (default: JPEG pack player).
+4. With a passenger operating the browser and filming, shift to **Drive**. Observe: frames advance in the `<img>`, audio is
    audible, lips/instruments stay aligned. The HUD reports
-   `Renderer: … JPEG <img> (not <video>)`. View-source / DevTools (if
-   available) confirms no visible `<video>`.
+   `Renderer: JPEG pack → <img>` and `<video> in DOM: 0` in the Debug panel.
 
-Desktop sanity check: `cd frontend && ln -sfn ../media videos && python3 -m http.server 8080`,
+Desktop sanity check: `cd frontend && ln -sfn ../media videos && ln -sfn ../packs packs && python3 -m http.server 8080`,
 then open `http://127.0.0.1:8080/`.
 
 ## Suggested fix

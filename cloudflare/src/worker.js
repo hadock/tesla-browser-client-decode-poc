@@ -16,7 +16,7 @@ function sessionIdOf(raw) {
   return s || "unknown";
 }
 
-async function handleLogs(request) {
+async function handleLogs(request, env) {
   if (request.method === "OPTIONS") return new Response(null, { status: 204 });
   if (request.method !== "POST") return json(405, { error: "POST only" });
 
@@ -88,7 +88,7 @@ async function handleVideo(request, env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname === "/api/logs") return handleLogs(request);
+    if (url.pathname === "/api/logs") return handleLogs(request, env);
     if (url.pathname.startsWith("/api/")) return json(404, { error: "not found" });
     if (url.pathname.startsWith("/videos/") && (request.method === "GET" || request.method === "HEAD")) {
       return handleVideo(request, env);

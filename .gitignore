@@ -12,4 +12,9 @@ media/*.mp4
 packs/
 media/*.mp4
 
+# deploy-time state and personal deploy values (never commit)
 .deploy/
+.deploy.env.local
+.deploy.env.*.local
+cloudflare/wrangler.jsonc
+.wrangler/

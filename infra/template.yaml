@@ -7,11 +7,25 @@ Parameters:
   ProjectName:
     Type: String
     Default: tesla-browser-client-decode-poc
+  LogGroupName:
+    Type: String
+    Default: ""
+    Description: CloudWatch log group for browser logs. Empty = /<ProjectName>/browser.
+  BucketPrefix:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9-]{0,20}$"
+    Description: Optional S3 bucket name prefix (bucket = <prefix>-<ProjectName>). Empty = CloudFormation-generated name.
+
+Conditions:
+  DefaultLogGroup: !Equals [!Ref LogGroupName, ""]
+  AutoBucketName: !Equals [!Ref BucketPrefix, ""]
 
 Resources:
   MediaBucket:
     Type: AWS::S3::Bucket
     Properties:
+      BucketName: !If [AutoBucketName, !Ref "AWS::NoValue", !Sub "${BucketPrefix}-${ProjectName}"]
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -58,7 +72,7 @@ Resources:
   BrowserLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/${ProjectName}/browser"
+      LogGroupName: !If [DefaultLogGroup, !Sub "/${ProjectName}/browser", !Ref LogGroupName]
       RetentionInDays: 14
 
   LogIngestRole:

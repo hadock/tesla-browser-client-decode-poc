@@ -14,8 +14,17 @@ submission associated with this finding, or email `you@example.com`
 
 - Demonstrates client-side decode of an MP4 into JPEG `<img>` frames +
   Web Audio PCM, with no visible `<video>` element.
-- Static site only (S3 + CloudFront). No user accounts, no PII collected.
+- Static site (Cloudflare Worker + Static Assets, or S3 + CloudFront) plus a
+  same-origin debug-log endpoint. No user accounts; logs carry a random
+  per-page session id and the browser user agent only.
 - Source media is CC BY 3.0; attribution is displayed.
+
+## Disclaimer
+
+Proof of concept for security research and testing only. Not for use while
+driving — test parked or with a passenger filming. Provided as-is, without
+warranty. Responsibility for any use lies entirely with the person who
+deploys or uses it.
 
 ## What this is not
 

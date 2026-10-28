@@ -1,6 +1,7 @@
-/* Runtime config — written by deploy.sh */
+/* Runtime config. Local-dev default; ./deploy.sh writes the real one into the build. */
 window.POC_CONFIG = {
   logsUrl: "/api/logs",
   webCodecsTimeoutMs: 10000,
-  logGroup: "/tesla-browser-client-decode-poc/browser"
+  logTarget: "local",
+  logGroup: ""
 };

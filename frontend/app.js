@@ -108,7 +108,7 @@
   let switchToken = 0;      // latest playlist tap wins
   function isAborted(gen) { return stopRequested || gen !== playGen; }
 
-  /* ---------- CloudWatch client logger ---------- */
+  /* ---------- client logger: POST /api/logs (CloudWatch on AWS, Workers Logs on Cloudflare) ---------- */
   const logQueue = [];
   let flushTimer = null;
   let flushing = false;

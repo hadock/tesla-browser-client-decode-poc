@@ -1,28 +1,56 @@
 #!/usr/bin/env bash
-# Deploy the client-decode PoC: CloudFormation + Lambda zip + S3 sync + Insights queries + CloudFront.
-# Auth: export AWS_* from AWS_POC_CREDENTIALS_JSON (nested credentials shape).
+# AWS target. Normally run via: ./deploy.sh aws [mode]
+#   CloudFormation (S3 + CloudFront OAC + API Gateway + Lambda) + S3 sync + Insights queries.
+# Inputs (env): STACK_NAME, AWS_REGION/AWS_DEFAULT_REGION, AWS_PROFILE (standard AWS chain),
+#   LOG_GROUP_NAME (default /<stack>/browser), BUCKET_PREFIX (optional),
+#   EXPECTED_AWS_ACCOUNT (optional guard). Nothing account-specific is stored in the repo.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STACK="${STACK_NAME:-tesla-browser-client-decode-poc}"
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
+export AWS_REGION="$REGION"
 MODE="${1:-all}"
-LOG_GROUP_NAME="/${STACK}/browser"
-QUERY_FAIL_NAME="tesla-client-decode-car-failures"
-QUERY_SESSION_NAME="tesla-client-decode-session"
-QUERY_HB_NAME="tesla-client-decode-heartbeat"
+LOG_GROUP_NAME="${LOG_GROUP_NAME:-/${STACK}/browser}"
+BUCKET_PREFIX="${BUCKET_PREFIX:-}"
+QUERY_PREFIX="${QUERY_PREFIX:-tesla-client-decode}"
+QUERY_FAIL_NAME="${QUERY_PREFIX}-car-failures"
+QUERY_SESSION_NAME="${QUERY_PREFIX}-session"
+QUERY_HB_NAME="${QUERY_PREFIX}-heartbeat"
+STATE="$ROOT/.deploy"   # gitignored: saved query ids, generated config
 
 need() { command -v "$1" >/dev/null || { echo "missing: $1" >&2; exit 1; }; }
 need aws
 need python3
 
-echo "Stack=$STACK Region=$REGION Mode=$MODE"
+case "$MODE" in
+  all|stack|frontend|videos|packs|invalidate|lambda|queries|validate|dry-run) ;;
+  *) echo "aws modes: all|stack|frontend|videos|packs|invalidate|lambda|queries|validate|dry-run" >&2; exit 2 ;;
+esac
+
+echo "Stack=$STACK Region=$REGION Mode=$MODE LogGroup=$LOG_GROUP_NAME BucketPrefix=${BUCKET_PREFIX:-<auto>}"
+
+CFN_PARAMS=(ProjectName="$STACK" LogGroupName="$LOG_GROUP_NAME" BucketPrefix="$BUCKET_PREFIX")
+
+if [[ "$MODE" == "validate" ]]; then
+  aws cloudformation validate-template --template-body "file://$ROOT/infra/template.yaml" \
+    --query '{Params:Parameters[].ParameterKey,Caps:Capabilities}' --output json
+  exit 0
+fi
 
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-echo "Account=$ACCOUNT"
-if [[ "$ACCOUNT" != "<AWS_ACCOUNT_ID>" ]]; then
-  echo "Refusing to deploy to unexpected account $ACCOUNT" >&2
+echo "Account=****${ACCOUNT: -4}"
+if [[ -n "${EXPECTED_AWS_ACCOUNT:-}" && "$ACCOUNT" != "$EXPECTED_AWS_ACCOUNT" ]]; then
+  echo "Refusing to deploy: caller account does not match EXPECTED_AWS_ACCOUNT" >&2
   exit 1
+fi
+
+if [[ "$MODE" == "dry-run" ]]; then
+  echo "==> Change set preview (no changes executed)"
+  aws cloudformation deploy --stack-name "$STACK" --template-file "$ROOT/infra/template.yaml" \
+    --parameter-overrides "${CFN_PARAMS[@]}" --capabilities CAPABILITY_NAMED_IAM \
+    --no-execute-changeset --no-fail-on-empty-changeset --region "$REGION"
+  exit 0
 fi
 
 deploy_stack() {
@@ -30,7 +58,7 @@ deploy_stack() {
   aws cloudformation deploy \
     --stack-name "$STACK" \
     --template-file "$ROOT/infra/template.yaml" \
-    --parameter-overrides ProjectName="$STACK" \
+    --parameter-overrides "${CFN_PARAMS[@]}" \
     --capabilities CAPABILITY_NAMED_IAM \
     --no-fail-on-empty-changeset \
     --region "$REGION"
@@ -66,11 +94,13 @@ PYZ
 }
 
 write_config() {
-  cat > "$ROOT/frontend/config.js" <<EOF
-/* Runtime config — written by deploy.sh */
+  mkdir -p "$STATE"
+  cat > "$STATE/config.js" <<EOF
+/* Runtime config - generated at deploy time (aws target) */
 window.POC_CONFIG = {
   logsUrl: "/api/logs",
   webCodecsTimeoutMs: 10000,
+  logTarget: "aws",
   logGroup: "${LOG_GROUP_NAME}"
 };
 EOF
@@ -84,6 +114,7 @@ upload_frontend() {
     --delete \
     --exclude "videos/*" \
     --exclude "packs/*" \
+    --exclude "config.js" \
     --cache-control "public,max-age=60" \
     --region "$REGION"
   aws s3 cp "$ROOT/frontend/index.html" "s3://$bucket/index.html" \
@@ -98,7 +129,7 @@ upload_frontend() {
     --cache-control "no-cache" \
     --content-type "application/javascript; charset=utf-8" \
     --region "$REGION"
-  aws s3 cp "$ROOT/frontend/config.js" "s3://$bucket/config.js" \
+  aws s3 cp "$STATE/config.js" "s3://$bucket/config.js" \
     --cache-control "no-cache" \
     --content-type "application/javascript; charset=utf-8" \
     --region "$REGION"
@@ -250,10 +281,6 @@ PY
   fi
 }
 
-case "$MODE" in
-  all|stack|frontend|videos|packs|invalidate|lambda|queries) ;;
-  *) echo "usage: $0 [all|stack|frontend|videos|packs|invalidate|lambda|queries]" >&2; exit 2 ;;
-esac
 
 if [[ "$MODE" == "all" || "$MODE" == "stack" ]]; then
   deploy_stack

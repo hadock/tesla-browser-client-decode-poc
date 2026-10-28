@@ -1,0 +1,34 @@
+// Template for the generated cloudflare/wrangler.jsonc (gitignored).
+// scripts/deploy-cloudflare.sh fills the __PLACEHOLDERS__ from env / flags:
+//   __WORKER_NAME__   <- WORKER_NAME   (default tesla-client-decode-poc)
+//   __ACCOUNT_ID__    <- CLOUDFLARE_ACCOUNT_ID (line dropped when unset; wrangler login decides)
+//   __WORKERS_DEV__   <- true without CUSTOM_DOMAIN, false with one
+//   __ROUTES__        <- [] or [{ "pattern": CUSTOM_DOMAIN, "custom_domain": true }]
+// Do not put account IDs or domains in this file.
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "__WORKER_NAME__",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-10-01",
+  "account_id": "__ACCOUNT_ID__",
+  "workers_dev": __WORKERS_DEV__,
+  "preview_urls": false,
+  // SPA + /videos/*.mp4 + /packs/** are Workers Static Assets (built into ./dist).
+  // Only /api/* (logs) and /videos/* (byte-range 206 support) run Worker code.
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "404-page",
+    "run_worker_first": ["/api/*", "/videos/*"]
+  },
+  // Custom Domain (optional): Cloudflare creates the DNS record + edge cert for
+  // that one hostname only. Empty means workers.dev only.
+  "routes": __ROUTES__,
+  // Workers Logs: every console.log from /api/logs is queryable in the dashboard
+  // (Workers & Pages > <worker> > Observability > Logs) and via `wrangler tail`.
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": { "enabled": true, "invocation_logs": false }
+  }
+}

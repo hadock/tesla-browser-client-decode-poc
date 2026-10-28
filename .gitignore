@@ -1,0 +1,11 @@
+.DS_Store
+node_modules/
+*.log
+.env
+.env.*
+.aws/
+.idea/
+.vscode/
+dist/
+build/
+media/*.mp4

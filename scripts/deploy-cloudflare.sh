@@ -4,6 +4,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CF="$ROOT/cloudflare"
+# wrangler needs a writable cache dir; without a package.json it would try /node_modules/.cache
+export WRANGLER_CACHE_DIR="${WRANGLER_CACHE_DIR:-$CF/.wrangler/cache}"
 DIST="$CF/dist"
 MODE="${1:-all}"
 export WORKER_NAME="${WORKER_NAME:-tesla-client-decode-poc}"

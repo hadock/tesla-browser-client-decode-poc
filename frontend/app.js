@@ -1,4 +1,4 @@
-\
+
 /* Tesla Browser Client Decode PoC
  * Loads an MP4 same-origin, decodes it in the browser, and renders
  * JPEG frames into an <img> (or canvas) while playing PCM via Web Audio.
@@ -45,6 +45,15 @@
   let fpsWindow = [];
   let rendererMode = "—";
   let webCodecsOk = !!(window.VideoDecoder && window.AudioDecoder && window.VideoFrame);
+  let playlistMode = false;
+  let playlistIndex = 0;
+  let playlistActive = false;
+
+  const btnPlayAll = $("btnPlayAll");
+  const chkLoop = $("chkLoop");
+  const nowPlaying = $("nowPlaying");
+  const nowPlayingText = $("nowPlayingText");
+  const nowPlayingPos = $("nowPlayingPos");
 
   hud.web.textContent = webCodecsOk ? "yes" : "no (canvas fallback)";
   hud.web.style.color = webCodecsOk ? "var(--ok)" : "var(--warn)";
@@ -375,54 +384,142 @@
   }
 
   /* ---------- Orchestration ---------- */
-  async function playSelected() {
-    if (!selected || !selected.src) return;
-    stopRequested = false;
-    playing = true;
-    btnPlay.disabled = true;
-    btnStop.disabled = false;
+  function highlightPlaying(slug) {
+    [...clipList.querySelectorAll(".clip")].forEach((b) => {
+      b.classList.toggle("playing", !!slug && b.dataset.slug === slug);
+      if (slug) b.classList.toggle("selected", b.dataset.slug === slug);
+    });
+  }
+
+  function updateNowPlaying(clip, index, total) {
+    if (!clip) {
+      nowPlaying.hidden = true;
+      return;
+    }
+    nowPlaying.hidden = false;
+    nowPlayingText.textContent = `${clip.artist} — "${clip.title}"`;
+    nowPlayingPos.textContent = `(${index + 1} / ${total})`;
+  }
+
+  /** Play one src end-to-end. Returns true if it finished naturally, false if stopped/errored. */
+  async function playOne(src, meta) {
     resetHud();
     setStatus("Loading…");
-    showAttribution(selected.meta || null);
+    showAttribution(meta || null);
+    if (meta && meta.slug) highlightPlaying(meta.slug);
 
     try {
-      // Prefer WebCodecs when available; fall back to canvas on any failure.
       if (webCodecsOk) {
         try {
-          await playViaWebCodecs(selected.src);
+          await playViaWebCodecs(src);
         } catch (e) {
           console.warn("WebCodecs path failed, using canvas fallback:", e);
           hud.web.textContent = "failed → canvas";
-          if (!stopRequested) await playViaCanvas(selected.src);
+          if (!stopRequested) await playViaCanvas(src);
         }
       } else {
-        await playViaCanvas(selected.src);
+        await playViaCanvas(src);
       }
-      if (!stopRequested) setStatus("Finished");
+      return !stopRequested;
     } catch (e) {
       console.error(e);
       setStatus("Error: " + (e && e.message ? e.message : e));
+      return false;
     } finally {
-      playing = false;
-      btnPlay.disabled = !selected;
-      btnStop.disabled = true;
       try { hiddenVideo.pause(); } catch (_) {}
       stopAudio();
+      // Keep last frame visible; revoke only the blob URL to free memory.
       revokeObjectUrl();
     }
   }
 
+  async function playSelected() {
+    if (!selected || !selected.src || playing) return;
+    playlistMode = false;
+    playlistActive = false;
+    nowPlaying.hidden = true;
+    stopRequested = false;
+    playing = true;
+    btnPlay.disabled = true;
+    btnPlayAll.disabled = true;
+    btnStop.disabled = false;
+
+    const ok = await playOne(selected.src, selected.meta || null);
+    if (ok) setStatus("Finished");
+    else if (stopRequested) setStatus("Stopped");
+
+    playing = false;
+    btnPlay.disabled = !selected;
+    btnPlayAll.disabled = !(catalog && catalog.clips && catalog.clips.length);
+    btnStop.disabled = true;
+    highlightPlaying(null);
+  }
+
+  async function playPlaylist() {
+    if (!catalog || !catalog.clips || !catalog.clips.length || playing) return;
+    playlistMode = true;
+    playlistActive = true;
+    stopRequested = false;
+    playing = true;
+    playlistIndex = 0;
+    btnPlay.disabled = true;
+    btnPlayAll.disabled = true;
+    btnStop.disabled = false;
+
+    const clips = catalog.clips;
+    const total = clips.length;
+
+    while (playlistActive && !stopRequested) {
+      const clip = clips[playlistIndex];
+      selected = { src: clip.src, meta: clip };
+      updateNowPlaying(clip, playlistIndex, total);
+      setStatus(`Playlist — ${clip.artist}`);
+
+      const finished = await playOne(clip.src, clip);
+      if (!finished || stopRequested) break;
+
+      // Advance to next clip. Brief yield so the next decode can start cleanly.
+      playlistIndex += 1;
+      if (playlistIndex >= total) {
+        if (chkLoop && chkLoop.checked) {
+          playlistIndex = 0;
+          setStatus("Playlist — looping…");
+          await new Promise((r) => setTimeout(r, 250));
+        } else {
+          setStatus("Playlist finished");
+          break;
+        }
+      } else {
+        // Tiny gap so audio/decoder teardown settles before next clip.
+        await new Promise((r) => setTimeout(r, 150));
+      }
+    }
+
+    if (stopRequested) setStatus("Playlist stopped");
+    playlistActive = false;
+    playlistMode = false;
+    playing = false;
+    btnPlay.disabled = !selected;
+    btnPlayAll.disabled = false;
+    btnStop.disabled = true;
+    highlightPlaying(null);
+    // Keep last now-playing visible so the car demo shows what just ran.
+  }
+
   function stopPlayback() {
     stopRequested = true;
+    playlistActive = false;
     try { hiddenVideo.pause(); } catch (_) {}
     stopAudio();
-    setStatus("Stopped");
+    setStatus(playlistMode ? "Playlist stopped" : "Stopped");
   }
 
   function selectClip(clip) {
+    if (playing) return; // don't switch mid-play; use Stop first
     selected = { src: clip.src, meta: clip };
     [...clipList.querySelectorAll(".clip")].forEach((b) => {
       b.classList.toggle("selected", b.dataset.slug === clip.slug);
+      b.classList.remove("playing");
     });
     urlInput.value = "";
     btnPlay.disabled = false;
@@ -431,11 +528,15 @@
   }
 
   function selectUrl(url) {
-    if (!url) return;
+    if (!url || playing) return;
     selected = { src: url, meta: null };
-    [...clipList.querySelectorAll(".clip")].forEach((b) => b.classList.remove("selected"));
+    [...clipList.querySelectorAll(".clip")].forEach((b) => {
+      b.classList.remove("selected");
+      b.classList.remove("playing");
+    });
     btnPlay.disabled = false;
     showAttribution(null);
+    nowPlaying.hidden = true;
     setStatus("Ready — custom URL (needs CORS)");
   }
 
@@ -453,13 +554,16 @@
     }
     const def = catalog.clips.find((c) => c.slug === catalog.defaultClip) || catalog.clips[0];
     if (def) selectClip(def);
+    btnPlayAll.disabled = catalog.clips.length === 0;
 
     urlInput.addEventListener("change", () => selectUrl(urlInput.value.trim()));
     urlInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") selectUrl(urlInput.value.trim());
     });
     btnPlay.addEventListener("click", () => { if (!playing) playSelected(); });
+    btnPlayAll.addEventListener("click", () => { if (!playing) playPlaylist(); });
     btnStop.addEventListener("click", stopPlayback);
+    setStatus("Ready — tap Play all for the playlist");
   }
 
   boot().catch((e) => setStatus("Boot error: " + e.message));

@@ -12,8 +12,23 @@
     <p class="tagline">Video → JPEG frames + PCM audio, entirely in the browser. No &lt;video&gt; is ever shown.</p>
   </header>
 
+  <section class="playlist" id="playlistSection">
+    <button type="button" id="btnPlayAll" class="play-all" disabled>
+      ▶ Play all — playlist
+    </button>
+    <label class="loop-label">
+      <input type="checkbox" id="chkLoop" checked />
+      Loop playlist
+    </label>
+    <div id="nowPlaying" class="now-playing" hidden>
+      <span class="k">Now playing</span>
+      <span id="nowPlayingText">—</span>
+      <span id="nowPlayingPos" class="pos"></span>
+    </div>
+  </section>
+
   <section class="picker" id="picker">
-    <h2>Hosted clips (same-origin)</h2>
+    <h2>Or pick one clip</h2>
     <div id="clipList" class="clip-list"></div>
     <label class="url-label">Or paste a video URL
       <input id="urlInput" type="url" placeholder="https://example.com/clip.mp4 (needs CORS)" />

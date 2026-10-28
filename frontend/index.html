@@ -9,8 +9,13 @@
 <body>
   <header>
     <h1>Client-side decode PoC</h1>
-    <p class="tagline">Video → JPEG frames + PCM audio, entirely in the browser. No &lt;video&gt; is ever shown.</p>
+    <p class="tagline">MP4 → JPEG &lt;img&gt; frames + Web Audio PCM. Drive-safe: no &lt;video&gt; unless ?allowVideo=1.</p>
   </header>
+
+  <section class="caps" id="caps">
+    <h2>Capability probe <span class="caps-hint">(screenshot this from the car)</span></h2>
+    <div class="caps-grid" id="capsGrid"></div>
+  </section>
 
   <section class="playlist" id="playlistSection">
     <button type="button" id="btnPlayAll" class="play-all" disabled>
@@ -33,14 +38,14 @@
     <label class="url-label">Or paste a video URL
       <input id="urlInput" type="url" placeholder="https://example.com/clip.mp4 (needs CORS)" />
     </label>
-    <p class="hint">External URLs only work if the origin allows CORS. Hosted clips above are same-origin via CloudFront — no CORS needed.</p>
+    <p class="hint">Hosted clips are same-origin. Live decode uses WebCodecs (no &lt;video&gt;). If VideoDecoder is missing, a labeled JPEG+PCM pack fallback is used — still no &lt;video&gt;. Pass <code>?allowVideo=1</code> only for phone debugging of the old media-element path.</p>
   </section>
 
   <section class="stage">
     <!-- Intentional: the user sees an <img>, NEVER a <video>. -->
     <img id="frame" alt="Decoded JPEG frame" width="1280" height="720" />
     <canvas id="scratch" width="1280" height="720" hidden></canvas>
-    <video id="hiddenVideo" playsinline muted crossorigin="anonymous" hidden></video>
+    <!-- <video> is NOT in the DOM. Created only if ?allowVideo=1. -->
   </section>
 
   <section class="controls">
@@ -51,10 +56,12 @@
 
   <section class="hud" id="hud">
     <div><span class="k">WebCodecs</span> <span id="hWebCodecs">?</span></div>
+    <div><span class="k">Path</span> <span id="hPath">—</span></div>
     <div><span class="k">Renderer</span> <span id="hRenderer">—</span></div>
     <div><span class="k">FPS</span> <span id="hFps">—</span></div>
     <div><span class="k">Frames</span> <span id="hFrames">0</span></div>
     <div><span class="k">Audio</span> <span id="hAudio">—</span></div>
+    <div><span class="k">Video el</span> <span id="hVideoEl">0</span></div>
     <div><span class="k">T</span> <span id="hTime">0.0s</span></div>
   </section>
 
@@ -66,7 +73,7 @@
   </section>
 
   <footer>
-    <p>Responsible disclosure PoC — Drive-mode media bypass via client-side decode. Not a consumer product.</p>
+    <p>Responsible disclosure PoC — Drive-mode media bypass via client-side decode / JPEG+PCM. Not a consumer product.</p>
   </footer>
 
   <script src="vendor/mp4box.all.min.js"></script>

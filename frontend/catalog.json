@@ -12,7 +12,8 @@
       "sourceUrl": "https://commons.wikimedia.org/wiki/File:Patricia_Jane%C4%8Dkov%C3%A1_La_Danza_(Rossini).webm",
       "segment": "50–120s of original",
       "description": "Soprano singing + roll-up piano — clear lip-sync and finger motion.",
-      "src": "/videos/patricia.mp4"
+      "src": "/videos/patricia.mp4",
+      "pack": "/packs/patricia/manifest.json"
     },
     {
       "slug": "rickastley",
@@ -24,7 +25,8 @@
       "sourceUrl": "https://commons.wikimedia.org/wiki/File:Rick_Astley_-_Never_Gonna_Give_You_Up_-_Festival_de_Vi%C3%B1a_del_Mar_2016_HD.webm",
       "segment": "45–115s of original",
       "description": "Live festival performance — singer with mic + band on stage.",
-      "src": "/videos/rickastley.mp4"
+      "src": "/videos/rickastley.mp4",
+      "pack": "/packs/rickastley/manifest.json"
     },
     {
       "slug": "spencerx",
@@ -36,7 +38,8 @@
       "sourceUrl": "https://commons.wikimedia.org/wiki/File:Spencer_X_-_Be_Somebody_(Beatbox_Music_Video).webm",
       "segment": "15–85s of original",
       "description": "Close-up beatbox studio take — very pronounced mouth motion.",
-      "src": "/videos/spencerx.mp4"
+      "src": "/videos/spencerx.mp4",
+      "pack": "/packs/spencerx/manifest.json"
     },
     {
       "slug": "decadentes",
@@ -48,8 +51,9 @@
       "sourceUrl": "https://commons.wikimedia.org/wiki/File:Yo_No_Soy_Tu_Prisionero_-_Los_Aut%C3%A9nticos_Decadentes,_Vi%C3%B1a_del_Mar_International_Song_Festival_(2014).ogv",
       "segment": "30–100s of original",
       "description": "Full ska band on stage — guitars, accordion, drums, lead vocals.",
-      "src": "/videos/decadentes.mp4"
+      "src": "/videos/decadentes.mp4",
+      "pack": "/packs/decadentes/manifest.json"
     }
   ],
-  "notes": "All clips are Creative Commons Attribution 3.0 (CC BY 3.0), trimmed ~70s segments re-encoded to H.264/AAC 720p MP4. Served same-origin from /videos/. Decoded in the browser and rendered as canvas/JPEG <img> frames + Web Audio — no <video> element is ever shown."
+  "notes": "All clips are Creative Commons Attribution 3.0 (CC BY 3.0), trimmed ~70s segments re-encoded to H.264/AAC 720p MP4. Served same-origin from /videos/. Decoded in the browser and rendered as canvas/JPEG <img> frames + Web Audio — no <video> element is ever shown. Drive-safe: WebCodecs live decode first; labeled /packs/ JPEG+PCM fallback when VideoDecoder missing. No <video> unless ?allowVideo=1."
 }

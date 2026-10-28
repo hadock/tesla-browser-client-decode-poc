@@ -9,3 +9,5 @@ node_modules/
 dist/
 build/
 media/*.mp4
+packs/
+media/*.mp4

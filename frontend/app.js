@@ -1,19 +1,24 @@
-
-/* Tesla Browser Client Decode PoC
- * Loads an MP4 same-origin, decodes it in the browser, and renders
- * JPEG frames into an <img> (or canvas) while playing PCM via Web Audio.
- * A <video> element is NEVER shown — that is the Drive-mode bypass surface.
+/* Tesla Browser Client Decode PoC — Drive-safe
+ * Default path: WebCodecs VideoDecoder + decodeAudioData. Zero <video>/<audio> elements.
+ * If VideoDecoder missing: labeled JPEG+PCM pack fallback (still no <video>).
+ * Old hidden-<video> canvas path only with ?allowVideo=1 (phone debug).
  */
 (function () {
   "use strict";
 
   const $ = (id) => document.getElementById(id);
+  const params = new URLSearchParams(location.search);
+  const ALLOW_VIDEO = params.get("allowVideo") === "1" || params.get("allowvideo") === "1";
+  const FORCE_PACK = params.get("pack") === "1";
+  const FORCE_DRIVE = params.get("drive") === "1"; // alias: never allow video
+
   const frameEl = $("frame");
   const scratch = $("scratch");
   const scratchCtx = scratch.getContext("2d", { willReadFrequently: true });
-  const hiddenVideo = $("hiddenVideo");
   const btnPlay = $("btnPlay");
   const btnStop = $("btnStop");
+  const btnPlayAll = $("btnPlayAll");
+  const chkLoop = $("chkLoop");
   const statusEl = $("status");
   const clipList = $("clipList");
   const urlInput = $("urlInput");
@@ -21,44 +26,65 @@
   const attrText = $("attrText");
   const attrLicense = $("attrLicense");
   const attrSource = $("attrSource");
+  const nowPlaying = $("nowPlaying");
+  const nowPlayingText = $("nowPlayingText");
+  const nowPlayingPos = $("nowPlayingPos");
+  const capsGrid = $("capsGrid");
 
   const hud = {
     web: $("hWebCodecs"),
+    path: $("hPath"),
     renderer: $("hRenderer"),
     fps: $("hFps"),
     frames: $("hFrames"),
     audio: $("hAudio"),
+    videoEl: $("hVideoEl"),
     time: $("hTime"),
   };
 
   const TARGET_FPS = 10;
   const FRAME_INTERVAL_MS = 1000 / TARGET_FPS;
 
+  const hasVideoDecoder = typeof VideoDecoder !== "undefined";
+  const hasAudioDecoder = typeof AudioDecoder !== "undefined";
+  const hasVideoFrame = typeof VideoFrame !== "undefined";
+  const hasEncodedVideoChunk = typeof EncodedVideoChunk !== "undefined";
+  const hasOffscreenCanvas = typeof OffscreenCanvas !== "undefined";
+  const hasMP4Box = typeof MP4Box !== "undefined";
+  // Live decode needs VideoDecoder + VideoFrame + EncodedVideoChunk (+ MP4Box demux).
+  // Audio uses decodeAudioData on the ArrayBuffer — no AudioDecoder, no <audio> required.
+  const webCodecsOk = hasVideoDecoder && hasVideoFrame && hasEncodedVideoChunk && hasMP4Box;
+
   let catalog = null;
-  let selected = null; // {src, meta?}
+  let selected = null;
   let playing = false;
   let stopRequested = false;
+  let playlistMode = false;
+  let playlistActive = false;
+  let playlistIndex = 0;
   let audioCtx = null;
   let audioSource = null;
   let objectUrl = null;
   let frameCount = 0;
   let fpsWindow = [];
-  let rendererMode = "—";
-  let webCodecsOk = !!(window.VideoDecoder && window.AudioDecoder && window.VideoFrame);
-  let playlistMode = false;
-  let playlistIndex = 0;
-  let playlistActive = false;
+  let hiddenVideo = null; // created ONLY if ALLOW_VIDEO && !FORCE_DRIVE
 
-  const btnPlayAll = $("btnPlayAll");
-  const chkLoop = $("chkLoop");
-  const nowPlaying = $("nowPlaying");
-  const nowPlayingText = $("nowPlayingText");
-  const nowPlayingPos = $("nowPlayingPos");
+  function countVideoEls() {
+    return document.querySelectorAll("video").length;
+  }
 
-  hud.web.textContent = webCodecsOk ? "yes" : "no (canvas fallback)";
-  hud.web.style.color = webCodecsOk ? "var(--ok)" : "var(--warn)";
+  function refreshVideoElHud() {
+    const n = countVideoEls();
+    hud.videoEl.textContent = String(n);
+    hud.videoEl.style.color = n === 0 ? "var(--ok)" : "var(--warn)";
+  }
 
   function setStatus(msg) { statusEl.textContent = msg; }
+
+  function setPath(label, ok) {
+    hud.path.textContent = label;
+    hud.path.style.color = ok ? "var(--ok)" : "var(--warn)";
+  }
 
   function revokeObjectUrl() {
     if (objectUrl) { URL.revokeObjectURL(objectUrl); objectUrl = null; }
@@ -81,6 +107,7 @@
     hud.time.textContent = "0.0s";
     hud.renderer.textContent = "—";
     hud.audio.textContent = "—";
+    refreshVideoElHud();
   }
 
   function tickFps() {
@@ -92,7 +119,6 @@
   }
 
   async function pushFrameFromCanvas() {
-    // Prefer Blob URL into <img> — that's the Drive-mode bypass surface.
     return new Promise((resolve) => {
       if (scratch.toBlob) {
         scratch.toBlob((blob) => {
@@ -113,9 +139,16 @@
     });
   }
 
+  function showJpegUrl(url) {
+    frameEl.src = url;
+    frameCount++;
+    tickFps();
+  }
+
   function ensureAudioCtx() {
     if (!audioCtx) {
       const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) throw new Error("Web Audio API unavailable");
       audioCtx = new AC();
     }
     if (audioCtx.state === "suspended") audioCtx.resume();
@@ -123,7 +156,7 @@
   }
 
   function stopAudio() {
-    try { if (audioSource) { audioSource.stop(0); } } catch (_) {}
+    try { if (audioSource) audioSource.stop(0); } catch (_) {}
     audioSource = null;
   }
 
@@ -136,226 +169,183 @@
     src.start(0);
     audioSource = src;
     hud.audio.textContent = `WebAudio ${buffer.sampleRate}Hz / ${buffer.numberOfChannels}ch`;
-    return new Promise((resolve) => {
-      src.onended = () => resolve();
-    });
+    return new Promise((resolve) => { src.onended = () => resolve(); });
   }
 
-  /* ---------- Canvas / <video> fallback path (Tesla-friendly) ---------- */
-  async function playViaCanvas(url) {
-    rendererMode = "canvas → JPEG <img> (not <video>)";
-    hud.renderer.textContent = rendererMode;
-    hud.renderer.style.color = "var(--ok)";
+  async function playPcmS16le(arrayBuffer, sampleRate, channels) {
+    const ctx = ensureAudioCtx();
+    const samples = arrayBuffer.byteLength / 2;
+    const frames = Math.floor(samples / channels);
+    const audioBuffer = ctx.createBuffer(channels, frames, sampleRate);
+    const view = new DataView(arrayBuffer);
+    for (let ch = 0; ch < channels; ch++) {
+      const out = audioBuffer.getChannelData(ch);
+      for (let i = 0; i < frames; i++) {
+        out[i] = view.getInt16((i * channels + ch) * 2, true) / 32768;
+      }
+    }
+    return playDecodedAudioBuffer(audioBuffer);
+  }
 
-    const v = hiddenVideo;
-    v.pause();
-    v.removeAttribute("src");
-    v.load();
-    v.crossOrigin = "anonymous";
-    v.muted = true; // audio comes from Web Audio, not the element
-    v.playsInline = true;
-    v.src = url;
+  /* ---------- Capability probe ---------- */
+  function renderCaps() {
+    const rows = [
+      ["VideoDecoder", hasVideoDecoder],
+      ["AudioDecoder", hasAudioDecoder],
+      ["VideoFrame", hasVideoFrame],
+      ["EncodedVideoChunk", hasEncodedVideoChunk],
+      ["OffscreenCanvas", hasOffscreenCanvas],
+      ["MP4Box demux", hasMP4Box],
+      ["Web Audio", !!(window.AudioContext || window.webkitAudioContext)],
+      ["decodeAudioData path", true],
+      ["allowVideo flag", ALLOW_VIDEO && !FORCE_DRIVE],
+      ["<video> in DOM", countVideoEls() > 0],
+      ["Live WebCodecs path", webCodecsOk && !FORCE_PACK],
+    ];
+    capsGrid.innerHTML = "";
+    for (const [k, v] of rows) {
+      const div = document.createElement("div");
+      const yes = !!v;
+      // For "<video> in DOM", zero is the good/Drive-safe state
+      const good = (k === "<video> in DOM" || k === "allowVideo flag") ? !yes || (k === "allowVideo flag" && !yes) : yes;
+      // simplify: show yes/no literally; color by whether Drive-safe preference holds
+      let cls = yes ? "cap-ok" : "cap-no";
+      if (k === "<video> in DOM") cls = yes ? "cap-no" : "cap-ok";
+      if (k === "allowVideo flag") cls = yes ? "cap-no" : "cap-ok";
+      div.innerHTML = `<span class="cap-k">${k}</span><span class="${cls}">${yes ? "yes" : "no"}</span>`;
+      capsGrid.appendChild(div);
+    }
+    hud.web.textContent = webCodecsOk ? "yes" : "no";
+    hud.web.style.color = webCodecsOk ? "var(--ok)" : "var(--warn)";
+    refreshVideoElHud();
+  }
 
-    await new Promise((resolve, reject) => {
-      const onMeta = () => { cleanup(); resolve(); };
-      const onErr = () => { cleanup(); reject(new Error("video load failed (CORS or unsupported codec)")); };
-      const cleanup = () => {
-        v.removeEventListener("loadedmetadata", onMeta);
-        v.removeEventListener("error", onErr);
-      };
-      v.addEventListener("loadedmetadata", onMeta);
-      v.addEventListener("error", onErr);
+  /* ---------- WebCodecs path (no media elements) ---------- */
+  function getAvcDescription(file, trackId) {
+    const trak = file.getTrackById(trackId);
+    if (!trak) return null;
+    const entries = (((trak.mdia || {}).minf || {}).stbl || {}).stsd
+      ? trak.mdia.minf.stbl.stsd.entries
+      : [];
+    for (const entry of entries || []) {
+      const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
+      if (!box) continue;
+      if (box.data) return box.data;
+      if (typeof DataStream === "undefined") continue;
+      try {
+        const stream = new DataStream();
+        stream.endianness = DataStream.BIG_ENDIAN;
+        box.write(stream);
+        // Skip 8-byte box header (size + type)
+        return new Uint8Array(stream.buffer, 8);
+      } catch (e) {
+        console.warn("avcC serialize failed", e);
+      }
+    }
+    return null;
+  }
+
+  async function demuxMp4(url) {
+    const ab = await fetch(url).then((r) => {
+      if (!r.ok) throw new Error("fetch " + r.status);
+      return r.arrayBuffer();
     });
+    const file = MP4Box.createFile();
+    const samples = { video: [], audio: [] };
+    let infoResolve;
+    const infoP = new Promise((r) => { infoResolve = r; });
+    file.onError = (e) => console.error("mp4box", e);
+    file.onReady = (info) => {
+      const vt = info.videoTracks[0];
+      const at = info.audioTracks[0];
+      if (vt) file.setExtractionOptions(vt.id, "video", { nbSamples: Infinity });
+      if (at) file.setExtractionOptions(at.id, "audio", { nbSamples: Infinity });
+      file.start();
+      infoResolve(info);
+    };
+    file.onSamples = (id, user, list) => {
+      for (const s of list) samples[user].push(s);
+    };
+    const buf = ab;
+    buf.fileStart = 0;
+    file.appendBuffer(buf);
+    file.flush();
+    const info = await infoP;
+    // Give extraction a tick to finish for in-memory files
+    await new Promise((r) => setTimeout(r, 30));
+    if (typeof file.stop === "function") file.stop();
+    return { ab, file, info, samples };
+  }
 
-    // Decode audio separately so we can play it via Web Audio while the
-    // visible path is only JPEG frames.
-    let audioDone = Promise.resolve();
-    try {
-      const ab = await fetch(url).then((r) => {
-        if (!r.ok) throw new Error("audio fetch " + r.status);
-        return r.arrayBuffer();
-      });
-      const ctx = ensureAudioCtx();
-      const decoded = await ctx.decodeAudioData(ab.slice(0));
-      audioDone = playDecodedAudioBuffer(decoded);
-    } catch (e) {
-      console.warn("decodeAudioData failed, falling back to element audio", e);
-      v.muted = false;
-      hud.audio.textContent = "element audio (fallback)";
+  async function playViaWebCodecs(url) {
+    if (!webCodecsOk) throw new Error("WebCodecs unavailable");
+    setPath("WebCodecs", true);
+    hud.renderer.textContent = "WebCodecs → canvas → JPEG <img>";
+    hud.renderer.style.color = "var(--ok)";
+    refreshVideoElHud();
+
+    const { ab, file, info, samples } = await demuxMp4(url);
+    const videoTrack = info.videoTracks[0];
+    if (!videoTrack || !samples.video.length) {
+      throw new Error("no video samples in MP4");
     }
 
-    // Size the scratch canvas to the video.
-    const w = v.videoWidth || 1280;
-    const h = v.videoHeight || 720;
+    const description = getAvcDescription(file, videoTrack.id);
+    const codec = videoTrack.codec || "avc1.42E01E";
+    const w = videoTrack.track_width || 1280;
+    const h = videoTrack.track_height || 720;
     scratch.width = w;
     scratch.height = h;
     frameEl.width = w;
     frameEl.height = h;
 
-    await v.play().catch(() => {}); // may be blocked if unmuted; we keep muted
-
-    setStatus("Playing (canvas → JPEG <img>)");
-    btnStop.disabled = false;
-
-    let lastCapture = 0;
-    await new Promise((resolve) => {
-      const loop = async (ts) => {
-        if (stopRequested || v.ended || v.paused) {
-          resolve();
-          return;
-        }
-        if (ts - lastCapture >= FRAME_INTERVAL_MS - 2) {
-          lastCapture = ts;
-          scratchCtx.drawImage(v, 0, 0, scratch.width, scratch.height);
-          await pushFrameFromCanvas();
-          hud.time.textContent = v.currentTime.toFixed(1) + "s";
-        }
-        requestAnimationFrame(loop);
-      };
-      requestAnimationFrame(loop);
-      // Also end when audio finishes if video somehow stalls.
-      audioDone.then(() => { if (!stopRequested) resolve(); });
-    });
-  }
-
-  /* ---------- WebCodecs path (modern Chromium) ---------- */
-  async function playViaWebCodecs(url) {
-    if (typeof MP4Box === "undefined") throw new Error("mp4box missing");
-    rendererMode = "WebCodecs → canvas → JPEG <img>";
-    hud.renderer.textContent = rendererMode;
-    hud.renderer.style.color = "var(--ok)";
-
-    const ab = await fetch(url).then((r) => {
-      if (!r.ok) throw new Error("fetch " + r.status);
-      return r.arrayBuffer();
-    });
-
-    // MP4Box wants a buffer with a fileStart property.
-    const file = MP4Box.createFile();
-    let videoTrack = null;
-    let audioTrack = null;
-    let videoDecoder = null;
-    let audioDecoder = null;
-    const videoFrames = []; // {timestamp_us, bitmap/canvas ready?}
-    const audioChunks = [];
-    let videoDesc = null;
-    let audioDesc = null;
-    let readyResolve;
-    const ready = new Promise((r) => { readyResolve = r; });
-
-    file.onError = (e) => console.error("mp4box", e);
-    file.onReady = (info) => {
-      videoTrack = info.videoTracks[0] || null;
-      audioTrack = info.audioTracks[0] || null;
-      if (videoTrack) {
-        file.setExtractionOptions(videoTrack.id, "video", { nbSamples: 100 });
-        const trak = file.getTrackById(videoTrack.id);
-        // AVCDecoderConfigurationRecord from avcC
-        const entry = trak && trak.mdia && trak.mdia.minf && trak.mdia.minf.stbl && trak.mdia.minf.stbl.stsd && trak.mdia.minf.stbl.stsd.entries[0];
-        if (entry && entry.avcC) {
-          videoDesc = entry.avcC;
-        }
-      }
-      if (audioTrack) {
-        file.setExtractionOptions(audioTrack.id, "audio", { nbSamples: 100 });
-      }
-      file.start();
-      readyResolve(info);
-    };
-
-    const samples = { video: [], audio: [] };
-    let extractDone = false;
-    file.onSamples = (id, user, sampleList) => {
-      const kind = user;
-      for (const s of sampleList) samples[kind].push(s);
-    };
-
-    // Feed the whole file.
-    const buf = ab;
-    buf.fileStart = 0;
-    file.appendBuffer(buf);
-    file.flush();
-    await ready;
-
-    // Wait briefly for samples to flush.
-    await new Promise((r) => setTimeout(r, 50));
-    extractDone = true;
-
-    if (!videoTrack || !samples.video.length) {
-      throw new Error("no video samples — falling back");
-    }
-
-    // Build description bytes for avcC if available.
-    let description;
-    try {
-      if (videoDesc) {
-        // mp4box exposes avcC as a box; use DataStream to serialize if present
-        if (videoDesc.data) description = videoDesc.data;
-        else if (typeof DataStream !== "undefined") {
-          const stream = new DataStream();
-          stream.endianness = DataStream.BIG_ENDIAN;
-          videoDesc.write(stream);
-          // skip the 8-byte box header
-          description = new Uint8Array(stream.buffer).slice(8);
-        }
-      }
-    } catch (e) {
-      console.warn("avcC serialize failed", e);
-    }
-
-    const codec = (videoTrack.codec || "avc1.42E01E");
-    const w = videoTrack.track_width || 1280;
-    const h = videoTrack.track_height || 720;
-    scratch.width = w; scratch.height = h;
-    frameEl.width = w; frameEl.height = h;
-
-    const decodedFrames = []; // {t_us, frame: VideoFrame}
-    videoDecoder = new VideoDecoder({
+    const timescale = videoTrack.timescale || 1000;
+    const decodedFrames = [];
+    const videoDecoder = new VideoDecoder({
       output: (frame) => { decodedFrames.push(frame); },
       error: (e) => console.error("VideoDecoder", e),
     });
     const config = { codec, codedWidth: w, codedHeight: h };
     if (description) config.description = description;
+    // Prefer hardware, fall back
     try {
-      videoDecoder.configure(config);
+      const support = await VideoDecoder.isConfigSupported(config);
+      if (!support.supported) {
+        throw new Error("VideoDecoder config unsupported: " + codec);
+      }
     } catch (e) {
-      throw new Error("VideoDecoder.configure failed: " + e.message);
+      if (e && /unsupported/.test(e.message)) throw e;
+      // isConfigSupported may itself be missing — continue
     }
+    videoDecoder.configure(config);
 
     for (const s of samples.video) {
       const chunk = new EncodedVideoChunk({
         type: s.is_sync ? "key" : "delta",
-        timestamp: s.cts * (1e6 / (videoTrack.timescale || 1000)),
-        duration: s.duration * (1e6 / (videoTrack.timescale || 1000)),
+        timestamp: (s.cts * 1e6) / timescale,
+        duration: (s.duration * 1e6) / timescale,
         data: s.data,
       });
       try { videoDecoder.decode(chunk); } catch (e) { console.warn(e); }
     }
     await videoDecoder.flush();
 
-    // Audio via decodeAudioData (simpler + more compatible than AudioDecoder for AAC).
-    let audioPromise = Promise.resolve();
+    // Audio: decodeAudioData on the same MP4 bytes — no <audio>/<video>
+    let audioBuffer = null;
     try {
       const ctx = ensureAudioCtx();
-      const decoded = await ctx.decodeAudioData(ab.slice(0));
-      // We'll start audio when the first frame is shown.
-      audioPromise = Promise.resolve(decoded);
+      audioBuffer = await ctx.decodeAudioData(ab.slice(0));
     } catch (e) {
-      console.warn("audio decode failed", e);
+      console.warn("decodeAudioData failed", e);
       hud.audio.textContent = "none";
     }
 
     setStatus("Playing (WebCodecs → JPEG <img>)");
     btnStop.disabled = false;
 
-    // Sort frames by timestamp and present at TARGET_FPS (drop extras).
     decodedFrames.sort((a, b) => a.timestamp - b.timestamp);
-    const audioBuffer = await audioPromise;
     const t0 = performance.now();
-    if (audioBuffer) {
-      // fire and forget; stopAudio handles teardown
-      playDecodedAudioBuffer(audioBuffer);
-    }
+    if (audioBuffer) playDecodedAudioBuffer(audioBuffer);
 
     let i = 0;
     let lastPresent = -FRAME_INTERVAL_MS;
@@ -365,7 +355,6 @@
         await new Promise((r) => setTimeout(r, 4));
         continue;
       }
-      // Find the frame closest to `now` in media time (timestamps are µs).
       const targetUs = now * 1000;
       while (i + 1 < decodedFrames.length && decodedFrames[i + 1].timestamp <= targetUs) {
         decodedFrames[i].close();
@@ -378,9 +367,138 @@
       lastPresent = now;
       await pushFrameFromCanvas();
       hud.time.textContent = (now / 1000).toFixed(1) + "s";
+      refreshVideoElHud();
     }
     while (i < decodedFrames.length) { decodedFrames[i].close(); i++; }
     try { videoDecoder.close(); } catch (_) {}
+  }
+
+  /* ---------- Pack fallback: JPEG sequence + PCM (no <video>, not live decode) ---------- */
+  async function playViaPack(meta) {
+    if (!meta || !meta.pack) throw new Error("no pack for clip");
+    setPath("pack fallback", false);
+    hud.renderer.textContent = "JPEG pack → <img> (no live decode, no <video>)";
+    hud.renderer.style.color = "var(--warn)";
+    refreshVideoElHud();
+
+    const manifest = await fetch(meta.pack).then((r) => {
+      if (!r.ok) throw new Error("pack manifest " + r.status);
+      return r.json();
+    });
+    const frames = manifest.frames || [];
+    if (!frames.length) throw new Error("empty pack");
+
+    const prefix = manifest.frames_prefix || (`/packs/${meta.slug}/frames/`);
+    const fps = manifest.fps || 10;
+    const interval = 1000 / fps;
+
+    // Start audio first (s16le PCM)
+    let audioDone = Promise.resolve();
+    try {
+      const pcm = await fetch(manifest.audio).then((r) => {
+        if (!r.ok) throw new Error("pcm " + r.status);
+        return r.arrayBuffer();
+      });
+      audioDone = playPcmS16le(
+        pcm,
+        manifest.audio_sample_rate || 24000,
+        manifest.audio_channels || 1
+      );
+      hud.audio.textContent = `PCM s16le ${manifest.audio_sample_rate}Hz`;
+    } catch (e) {
+      console.warn("pack audio failed", e);
+      hud.audio.textContent = "none";
+    }
+
+    setStatus("Playing (pack fallback — JPEG + PCM, no <video>)");
+    btnStop.disabled = false;
+
+    const t0 = performance.now();
+    for (let i = 0; i < frames.length && !stopRequested; i++) {
+      const target = t0 + i * interval;
+      const wait = target - performance.now();
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      showJpegUrl(prefix + frames[i]);
+      hud.time.textContent = ((performance.now() - t0) / 1000).toFixed(1) + "s";
+      refreshVideoElHud();
+    }
+    if (!stopRequested) await audioDone.catch(() => {});
+  }
+
+  /* ---------- Phone-only video-element fallback (?allowVideo=1) ---------- */
+  function ensureHiddenVideo() {
+    if (hiddenVideo) return hiddenVideo;
+    if (!ALLOW_VIDEO || FORCE_DRIVE) {
+      throw new Error("video element disabled (Drive-safe mode)");
+    }
+    const v = document.createElement("video");
+    v.id = "hiddenVideo";
+    v.playsInline = true;
+    v.muted = true;
+    v.crossOrigin = "anonymous";
+    v.hidden = true;
+    v.setAttribute("aria-hidden", "true");
+    document.querySelector(".stage").appendChild(v);
+    hiddenVideo = v;
+    renderCaps();
+    refreshVideoElHud();
+    return v;
+  }
+
+  async function playViaVideoElement(url) {
+    setPath("video element (debug)", false);
+    hud.renderer.textContent = "hidden <video> → canvas → JPEG (NOT Drive-safe)";
+    hud.renderer.style.color = "var(--danger)";
+    const v = ensureHiddenVideo();
+    v.pause();
+    v.removeAttribute("src");
+    v.load();
+    v.muted = true;
+    v.src = url;
+
+    await new Promise((resolve, reject) => {
+      const onMeta = () => { cleanup(); resolve(); };
+      const onErr = () => { cleanup(); reject(new Error("video load failed")); };
+      const cleanup = () => {
+        v.removeEventListener("loadedmetadata", onMeta);
+        v.removeEventListener("error", onErr);
+      };
+      v.addEventListener("loadedmetadata", onMeta);
+      v.addEventListener("error", onErr);
+    });
+
+    try {
+      const ab = await fetch(url).then((r) => r.arrayBuffer());
+      const ctx = ensureAudioCtx();
+      const decoded = await ctx.decodeAudioData(ab.slice(0));
+      playDecodedAudioBuffer(decoded);
+    } catch (e) {
+      console.warn(e);
+      v.muted = false;
+      hud.audio.textContent = "element audio";
+    }
+
+    scratch.width = v.videoWidth || 1280;
+    scratch.height = v.videoHeight || 720;
+    await v.play().catch(() => {});
+    setStatus("Playing (DEBUG video-element path — blocked in Drive)");
+    btnStop.disabled = false;
+
+    let lastCapture = 0;
+    await new Promise((resolve) => {
+      const loop = async (ts) => {
+        if (stopRequested || v.ended || v.paused) { resolve(); return; }
+        if (ts - lastCapture >= FRAME_INTERVAL_MS - 2) {
+          lastCapture = ts;
+          scratchCtx.drawImage(v, 0, 0, scratch.width, scratch.height);
+          await pushFrameFromCanvas();
+          hud.time.textContent = v.currentTime.toFixed(1) + "s";
+          refreshVideoElHud();
+        }
+        requestAnimationFrame(loop);
+      };
+      requestAnimationFrame(loop);
+    });
   }
 
   /* ---------- Orchestration ---------- */
@@ -392,16 +510,12 @@
   }
 
   function updateNowPlaying(clip, index, total) {
-    if (!clip) {
-      nowPlaying.hidden = true;
-      return;
-    }
+    if (!clip) { nowPlaying.hidden = true; return; }
     nowPlaying.hidden = false;
     nowPlayingText.textContent = `${clip.artist} — "${clip.title}"`;
     nowPlayingPos.textContent = `(${index + 1} / ${total})`;
   }
 
-  /** Play one src end-to-end. Returns true if it finished naturally, false if stopped/errored. */
   async function playOne(src, meta) {
     resetHud();
     setStatus("Loading…");
@@ -409,27 +523,52 @@
     if (meta && meta.slug) highlightPlaying(meta.slug);
 
     try {
+      // 1) Pack forced
+      if (FORCE_PACK && meta && meta.pack) {
+        await playViaPack(meta);
+        return !stopRequested;
+      }
+      // 2) WebCodecs live decode (preferred Drive-safe)
       if (webCodecsOk) {
         try {
           await playViaWebCodecs(src);
+          return !stopRequested;
         } catch (e) {
-          console.warn("WebCodecs path failed, using canvas fallback:", e);
-          hud.web.textContent = "failed → canvas";
-          if (!stopRequested) await playViaCanvas(src);
+          console.warn("WebCodecs failed:", e);
+          hud.web.textContent = "failed";
+          // Fall through to pack if this is a hosted clip
+          if (meta && meta.pack && !stopRequested) {
+            setStatus("WebCodecs failed — trying pack fallback…");
+            await playViaPack(meta);
+            return !stopRequested;
+          }
+          throw e;
         }
-      } else {
-        await playViaCanvas(src);
       }
-      return !stopRequested;
+      // 3) No WebCodecs: pack fallback for hosted clips
+      if (meta && meta.pack) {
+        setStatus("WebCodecs unavailable — pack fallback (no <video>)");
+        await playViaPack(meta);
+        return !stopRequested;
+      }
+      // 4) Phone debug only
+      if (ALLOW_VIDEO && !FORCE_DRIVE) {
+        await playViaVideoElement(src);
+        return !stopRequested;
+      }
+      setPath("blocked", false);
+      hud.renderer.textContent = "WebCodecs unavailable — Drive blocks <video>; cannot decode";
+      hud.renderer.style.color = "var(--danger)";
+      throw new Error("WebCodecs unavailable — Drive blocks <video>; cannot decode. Open with a hosted clip (pack fallback) or use a browser with VideoDecoder.");
     } catch (e) {
       console.error(e);
       setStatus("Error: " + (e && e.message ? e.message : e));
       return false;
     } finally {
-      try { hiddenVideo.pause(); } catch (_) {}
+      try { if (hiddenVideo) hiddenVideo.pause(); } catch (_) {}
       stopAudio();
-      // Keep last frame visible; revoke only the blob URL to free memory.
       revokeObjectUrl();
+      refreshVideoElHud();
     }
   }
 
@@ -473,12 +612,11 @@
       const clip = clips[playlistIndex];
       selected = { src: clip.src, meta: clip };
       updateNowPlaying(clip, playlistIndex, total);
-      setStatus(`Playlist — ${clip.artist}`);
+      setStatus("Playlist — " + clip.artist);
 
       const finished = await playOne(clip.src, clip);
       if (!finished || stopRequested) break;
 
-      // Advance to next clip. Brief yield so the next decode can start cleanly.
       playlistIndex += 1;
       if (playlistIndex >= total) {
         if (chkLoop && chkLoop.checked) {
@@ -490,7 +628,6 @@
           break;
         }
       } else {
-        // Tiny gap so audio/decoder teardown settles before next clip.
         await new Promise((r) => setTimeout(r, 150));
       }
     }
@@ -503,19 +640,18 @@
     btnPlayAll.disabled = false;
     btnStop.disabled = true;
     highlightPlaying(null);
-    // Keep last now-playing visible so the car demo shows what just ran.
   }
 
   function stopPlayback() {
     stopRequested = true;
     playlistActive = false;
-    try { hiddenVideo.pause(); } catch (_) {}
+    try { if (hiddenVideo) hiddenVideo.pause(); } catch (_) {}
     stopAudio();
     setStatus(playlistMode ? "Playlist stopped" : "Stopped");
   }
 
   function selectClip(clip) {
-    if (playing) return; // don't switch mid-play; use Stop first
+    if (playing) return;
     selected = { src: clip.src, meta: clip };
     [...clipList.querySelectorAll(".clip")].forEach((b) => {
       b.classList.toggle("selected", b.dataset.slug === clip.slug);
@@ -537,10 +673,11 @@
     btnPlay.disabled = false;
     showAttribution(null);
     nowPlaying.hidden = true;
-    setStatus("Ready — custom URL (needs CORS)");
+    setStatus("Ready — custom URL (WebCodecs only; no pack)");
   }
 
   async function boot() {
+    renderCaps();
     catalog = await fetch("catalog.json").then((r) => r.json());
     for (const c of catalog.clips) {
       const btn = document.createElement("button");
@@ -563,7 +700,15 @@
     btnPlay.addEventListener("click", () => { if (!playing) playSelected(); });
     btnPlayAll.addEventListener("click", () => { if (!playing) playPlaylist(); });
     btnStop.addEventListener("click", stopPlayback);
-    setStatus("Ready — tap Play all for the playlist");
+
+    if (!webCodecsOk) {
+      setStatus("WebCodecs unavailable — hosted clips will use JPEG+PCM pack (no <video>)");
+      setPath("pack (no WebCodecs)", false);
+    } else {
+      setStatus("Ready — WebCodecs path (no <video>). Tap Play all.");
+      setPath("WebCodecs ready", true);
+    }
+    refreshVideoElHud();
   }
 
   boot().catch((e) => setStatus("Boot error: " + e.message));

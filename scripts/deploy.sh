@@ -40,6 +40,30 @@ upload_frontend() {
   aws s3 cp "$ROOT/frontend/catalog.json" "s3://$bucket/catalog.json"     --cache-control "no-cache"     --content-type "application/json"     --region "$REGION"
 }
 
+
+upload_packs() {
+  local bucket="$1"
+  local packs="$ROOT/packs"
+  if [[ ! -d "$packs" ]]; then
+    echo "==> No packs/ dir — skipping pack fallback upload"
+    return 0
+  fi
+  echo "==> Upload Drive pack fallback → s3://$bucket/packs/"
+  for slug_dir in "$packs"/*; do
+    [[ -d "$slug_dir" ]] || continue
+    slug=$(basename "$slug_dir")
+    echo "  pack $slug"
+    aws s3 cp "$slug_dir/manifest.json" "s3://$bucket/packs/$slug/manifest.json" \
+      --content-type "application/json" --cache-control "no-cache" --region "$REGION"
+    aws s3 cp "$slug_dir/audio.pcm" "s3://$bucket/packs/$slug/audio.pcm" \
+      --content-type "application/octet-stream" --cache-control "public,max-age=86400" --region "$REGION"
+    # frames may be a symlink
+    frames="$slug_dir/frames"
+    aws s3 sync "$frames/" "s3://$bucket/packs/$slug/frames/" \
+      --content-type "image/jpeg" --cache-control "public,max-age=86400" --region "$REGION"
+  done
+}
+
 upload_videos() {
   local bucket="$1"
   echo "==> Upload videos → s3://$bucket/videos/"
@@ -58,8 +82,8 @@ invalidate() {
 }
 
 case "$MODE" in
-  all|stack|frontend|videos|invalidate) ;;
-  *) echo "usage: $0 [all|stack|frontend|videos|invalidate]" >&2; exit 2 ;;
+  all|stack|frontend|videos|packs|invalidate) ;;
+  *) echo "usage: $0 [all|stack|frontend|videos|packs|invalidate]" >&2; exit 2 ;;
 esac
 
 if [[ "$MODE" == "all" || "$MODE" == "stack" ]]; then
@@ -77,6 +101,9 @@ if [[ "$MODE" == "all" || "$MODE" == "frontend" ]]; then
 fi
 if [[ "$MODE" == "all" || "$MODE" == "videos" ]]; then
   upload_videos "$BUCKET"
+fi
+if [[ "$MODE" == "all" || "$MODE" == "packs" ]]; then
+  upload_packs "$BUCKET"
 fi
 if [[ "$MODE" == "all" || "$MODE" == "frontend" || "$MODE" == "invalidate" ]]; then
   invalidate "$DIST"

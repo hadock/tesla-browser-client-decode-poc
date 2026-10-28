@@ -108,3 +108,22 @@ footer { color: var(--muted); font-size: 0.8rem; padding-bottom: 28px; }
 .now-playing .k { color: var(--ok); margin-right: 8px; font-weight: 600; }
 .now-playing .pos { color: var(--muted); margin-left: 8px; font-variant-numeric: tabular-nums; }
 .clip.playing { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok); }
+
+.caps {
+  background: var(--panel);
+  border-radius: 10px;
+  margin: 12px auto;
+  border: 1px solid #243041;
+}
+.caps h2 { margin: 0 0 8px; font-size: 1rem; }
+.caps-hint { color: var(--muted); font-weight: 400; font-size: 0.85rem; }
+.caps-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 6px 12px;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.9rem;
+}
+.caps-grid .cap-ok { color: var(--ok); font-weight: 600; }
+.caps-grid .cap-no { color: var(--danger); font-weight: 600; }
+.caps-grid .cap-k { color: var(--muted); margin-right: 6px; }

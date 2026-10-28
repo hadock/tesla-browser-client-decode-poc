@@ -125,3 +125,30 @@ of drifting. `?chunks=0` forces the old one-request-per-frame mode.
 
 Console: CloudWatch → Logs → Insights → select the saved query.
 Car tip: open `?pack=1` or tap **Force pack fallback** first; WebCodecs may probe green but stall.
+
+## Cloudflare hosting (primary): https://<your-deployment>
+
+Everything is served same-origin by one Cloudflare Worker, `tesla-client-decode-poc` — nothing on AWS:
+
+| Path | Served by |
+| --- | --- |
+| `/`, `/app.js`, `/catalog.json`, `/vendor/*` | Workers Static Assets |
+| `/packs/<slug>/manifest.json`, `chunks/*.bin`, `frames/*.jpg`, `audio.pcm` | Workers Static Assets (cached 1 day) |
+| `/videos/<slug>.mp4` | Worker → Static Assets, with byte-range support (`206`/`416`) |
+| `POST /api/logs` | Worker → Workers Logs (one structured JSON entry per browser log line) |
+
+Files: `cloudflare/wrangler.jsonc`, `cloudflare/src/worker.js`, `cloudflare/build.sh`.
+
+```bash
+# needs local media/*.mp4 and packs/<slug>/ (see tools/build_chunks.py)
+npx wrangler login            # once
+cloudflare/build.sh deploy    # builds cloudflare/dist and runs wrangler deploy
+```
+
+`<your-deployment>` is a Worker **Custom Domain** (Cloudflare creates the DNS record and certificate). No other record or Worker on the zone is touched.
+
+### Reading car logs
+* Dashboard: **Workers & Pages → tesla-client-decode-poc → Observability → Logs**. Filter `sessionId = <id shown on the page>`; useful filters: `event = heartbeat`, `event = pack_fallback`, `level = error`.
+* Live: `cd cloudflare && npx wrangler tail tesla-client-decode-poc --format pretty --search <sessionId>`
+
+Each entry carries the original fields (`ts`, `level`, `event`, `msg`, `sessionId`, …) plus `source`, `colo`, `country`, `ua`.

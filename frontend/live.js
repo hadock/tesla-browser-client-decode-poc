@@ -1,4 +1,4 @@
-/* Live Streaming tab — fixed list of 3 public HLS test feeds.
+/* Live Streaming tab — fixed list of public HLS test feeds.
  * master/media playlist → demux (MPEG-TS via mux.js, or fMP4 via mp4box) →
  * WebCodecs → canvas → JPEG <img>, audio via AudioDecoder + Web Audio.
  * Zero <video>/<audio> elements. No user playlist URL, no proxy, nothing rehosted.
@@ -8,24 +8,35 @@
 
   var LIVE_STREAMS = [
     {
-      id: "nasa",
-      title: "NASA TV",
-      subtitle: "Public-domain live (HLS)",
-      note: "Third-party feed; not rehosted",
-      url: "https://ntv1.akamaized.net/hls/live/2014075/NASA-NTV1-HLS/master.m3u8"
+      id: "unified-live",
+      title: "Unified Streaming live",
+      subtitle: "True live HLS test (MPEG-TS)",
+      note: "Demo feed © Unified Streaming — not rehosted",
+      live: true,
+      url: "https://demo.unified-streaming.com/k8s/live/stable/live.isml/.m3u8"
     },
     {
-      id: "akamai",
-      title: "Akamai live test",
-      subtitle: "Player test live stream (HLS)",
-      note: "Third-party test feed; not rehosted",
-      url: "https://cph-p2p-msl.akamaized.net/hls/live/2000341/test/master.m3u8"
+      id: "mux-bbb",
+      title: "Mux · Big Buck Bunny",
+      subtitle: "VOD HLS test (MPEG-TS)",
+      note: "Big Buck Bunny © Blender Foundation (CC BY) via Mux test-streams — not rehosted",
+      live: false,
+      url: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+    },
+    {
+      id: "tears",
+      title: "Tears of Steel",
+      subtitle: "VOD HLS test (MPEG-TS)",
+      note: "Tears of Steel © Blender Foundation (CC BY) via Unified Streaming demo — not rehosted",
+      live: false,
+      url: "https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8"
     },
     {
       id: "apple",
       title: "Apple HLS example (fMP4)",
-      subtitle: "Official Apple test pattern",
-      note: "Third-party Apple CDN; not rehosted",
+      subtitle: "Official Apple test pattern (VOD)",
+      note: "Apple HLS example content — not rehosted",
+      live: false,
       url: "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8"
     }
   ];

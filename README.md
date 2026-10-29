@@ -66,15 +66,16 @@ vendored [mux.js](https://github.com/videojs/mux.js), or fMP4 via MP4Box),
 decode with WebCodecs, draw to a canvas, JPEG into an `<img>`, and play audio
 through Web Audio — still **zero** `<video>` / `<audio>` elements.
 
-The list is **fixed** to three public test feeds (no channel directory, no
-user-supplied M3U/URL, no proxy). Media stays on the third-party CDN; nothing
-is rehosted:
+The list is **fixed** to public player-test / CC-licensed demo feeds only
+(no TV channels, no IPTV directory, no user-supplied M3U/URL, no proxy).
+Media stays on the third-party CDN; nothing is rehosted:
 
-| Stream | URL |
-|--------|-----|
-| NASA TV (public domain) | `https://ntv1.akamaized.net/hls/live/2014075/NASA-NTV1-HLS/master.m3u8` |
-| Akamai live test | `https://cph-p2p-msl.akamaized.net/hls/live/2000341/test/master.m3u8` |
-| Apple HLS example (fMP4) | `https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8` |
+| Stream | Kind | Source / license | URL |
+|--------|------|------------------|-----|
+| Unified Streaming live | **Live** MPEG-TS | [Unified Streaming](https://docs.unified-streaming.com/) public live demo | `https://demo.unified-streaming.com/k8s/live/stable/live.isml/.m3u8` |
+| Mux · Big Buck Bunny | VOD MPEG-TS | [Mux test-streams](https://test-streams.mux.dev/); film © Blender Foundation (**CC BY**) | `https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8` |
+| Tears of Steel | VOD MPEG-TS | Unified Streaming demo; film © Blender Foundation (**CC BY**) | `https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8` |
+| Apple HLS example (fMP4) | VOD fMP4 | Official [Apple HLS example](https://developer.apple.com/streaming/examples/) | `https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8` |
 
 Open with `?tab=live`. On-screen **Live diagnostics** show WebCodecs support,
 frames decoded/drawn, buffer, and errors. Live HLS **requires WebCodecs**;

@@ -451,10 +451,14 @@
     }
 
     function audioQueueAheadUs() {
-      if (!self._audioQueue.length) return 0;
-      var a0 = self._audioQueue[0];
-      var aN = self._audioQueue[self._audioQueue.length - 1];
-      return Math.max(0, (aN.timestamp + (aN.duration || 0)) - a0.timestamp);
+      // Sum of durations, not head-to-tail PTS span: a PTS discontinuity
+      // inside the queue must not read as "minutes buffered" and stall decode.
+      var us = 0;
+      for (var i = 0; i < self._audioQueue.length; i++) {
+        var a = self._audioQueue[i];
+        us += a.duration || (a.numberOfFrames / (a.sampleRate || 48000)) * 1e6 || 0;
+      }
+      return us;
     }
 
     var MAX_READY = 48;
@@ -649,8 +653,13 @@
       try {
         audioTrackInfo = info.audioTracks[0];
         var codec = audioTrackInfo.codec || "mp4a.40.2";
-        self._audioDec = new AudioDecoder({
-          output: function (audioData) {
+        var aOutput, aError, aConfig;
+        var makeAudioDec = function () {
+          var d = new AudioDecoder({ output: aOutput, error: aError });
+          d.configure(aConfig);
+          return d;
+        };
+        aOutput = function (audioData) {
             if (self._aborted(gen)) { audioData.close(); return; }
             self.diag.audioChunks++;
             // Soft safety only — kickAudioDecode backpressures first.
@@ -659,19 +668,29 @@
               return;
             }
             self._audioQueue.push(audioData);
-          },
-          error: function (e) {
-            self._emit("warn", "live_audio_dec", { msg: String(e && (e.message || e)) });
-          }
-        });
-        var aConfig = {
+        };
+        // A WebCodecs decode error CLOSES the decoder. Before, that silently
+        // killed audio for the rest of the session (video kept going). Rebuild
+        // it with the same config and keep feeding the no-drop chunk queue.
+        aError = function (e) {
+          self._emit("warn", "live_audio_dec", { msg: String(e && (e.message || e)) });
+          if (self._aborted(gen)) return;
+          self.diag.audioDecResets = (self.diag.audioDecResets || 0) + 1;
+          if (self.diag.audioDecResets > 50) return;
+          setTimeout(function () {
+            if (self._aborted(gen)) return;
+            try { self._audioDec = makeAudioDec(); kickAudioDecode(); }
+            catch (e2) { self._emit("warn", "live_audio_cfg", { msg: e2.message }); }
+          }, 50);
+        };
+        aConfig = {
           codec: codec,
           numberOfChannels: (audioTrackInfo.audio && audioTrackInfo.audio.channel_count) || 2,
           sampleRate: (audioTrackInfo.audio && audioTrackInfo.audio.sample_rate) || 48000
         };
         var aDesc = getAudioDescription(mp4file, audioTrackInfo.id);
         if (aDesc) aConfig.description = aDesc;
-        self._audioDec.configure(aConfig);
+        self._audioDec = makeAudioDec();
         mp4file.setExtractionOptions(audioTrackInfo.id, "audio", { nbSamples: 50 });
         audioConfigured = true;
         if (ensureAudioCtx) {
@@ -735,7 +754,7 @@
       // callback cannot fill the video chunk queue and delay AAC queuing.
       for (i = 0; i < list.length; i++) {
         s = list[i];
-        if (user === "audio" && self._audioDec && self._audioDec.state === "configured") {
+        if (user === "audio" && self._audioDec) {
           timescale = audioTrackInfo.timescale || 44100;
           try {
             self._audioChunkQueue.push(new EncodedAudioChunk({
@@ -984,7 +1003,8 @@
               // instead of skipping or jumping the AudioContext timeline.
               if (this._lastAudioMediaTs != null) {
                 var mediaGapUs = ad.timestamp - this._lastAudioMediaTs;
-                if (mediaGapUs > 100000 && mediaGapUs < 2000000) {
+                if (mediaGapUs > 100000 && mediaGapUs < 2000000 &&
+                    this._nextAudioTime + mediaGapUs / 1e6 <= this._audioCtx.currentTime + MAX_AUDIO_SCHEDULE_SEC + 0.5) {
                   this._nextAudioTime += mediaGapUs / 1e6;
                 }
               }
@@ -999,6 +1019,8 @@
               var src = this._audioCtx.createBufferSource();
               src.buffer = ab;
               src.connect(this._audioCtx.destination);
+              // Never start in the past (WebKit drops/clips those).
+              if (this._nextAudioTime < this._audioCtx.currentTime) this._nextAudioTime = this._audioCtx.currentTime + 0.01;
               src.start(this._nextAudioTime);
               this._nextAudioTime += ab.duration;
               this._audioScheduledSec += ab.duration;

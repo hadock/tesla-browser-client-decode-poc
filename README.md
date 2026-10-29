@@ -267,3 +267,5 @@ derived packs are **not** MIT — they remain under their CC BY 3.0 licenses
 
 See `DISCLOSURE.md` and `SECURITY.md`. Intentional, minimal, not a consumer
 product.
+
+**Audio resilience (Live):** if the WebCodecs `AudioDecoder` errors (which closes it), it is rebuilt with the same config and the no-drop AAC queue keeps feeding it. A suspended/"interrupted" AudioContext (iOS lock screen, call, backgrounding) is resumed on the next tap/visibility return unless the user paused. `navigator.audioSession.type = "playback"` is set where supported so the iOS silent switch does not mute Web Audio. The decoded-audio budget is a sum of durations, so a PTS discontinuity can't stall decode.

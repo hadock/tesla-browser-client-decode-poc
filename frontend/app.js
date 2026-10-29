@@ -305,9 +305,31 @@
       if (!AC) throw new Error("Web Audio API unavailable");
       audioCtx = new AC();
     }
-    if (audioCtx.state === "suspended") audioCtx.resume();
+    resumeAudioIfAllowed();
     return audioCtx;
   }
+
+  // iOS/WebKit: a context can be "suspended" (no gesture yet, background) or
+  // "interrupted" (lock screen, call, Siri, route change) and never comes back
+  // on its own. Resume on any gesture/visibility return unless the user paused.
+  let liveUserPaused = false;
+  function resumeAudioIfAllowed() {
+    if (!audioCtx || audioCtx.state === "running" || audioCtx.state === "closed") return;
+    if (userPaused || liveUserPaused) return;
+    try { var p = audioCtx.resume(); if (p && p.catch) p.catch(function () {}); } catch (_) {}
+  }
+  try {
+    // Play through the iOS ring/silent switch like media does (Safari 16.4+).
+    if (navigator.audioSession) navigator.audioSession.type = "playback";
+  } catch (_) {}
+  ["pointerdown", "touchend", "click", "keydown"].forEach(function (ev) {
+    document.addEventListener(ev, resumeAudioIfAllowed, { capture: true, passive: true });
+  });
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") resumeAudioIfAllowed();
+  });
+  window.addEventListener("pageshow", resumeAudioIfAllowed);
+  window.addEventListener("focus", resumeAudioIfAllowed);
 
   function stopAudio() {
     try { if (audioSource) audioSource.stop(0); } catch (_) {}
@@ -1513,6 +1535,7 @@
       if (liveStatusEl) liveStatusEl.textContent = "live.js failed to load";
       return;
     }
+    liveUserPaused = false;
     unlockAudio();
     if (playing) stopPlayback();
     stopLive();
@@ -1618,10 +1641,12 @@
         // pause/resume via AudioContext suspend
         if (!audioCtx) return;
         if (audioCtx.state === "running") {
+          liveUserPaused = true;
           audioCtx.suspend();
           updateLiveStageUi(true, true);
           if (liveStatusEl) liveStatusEl.textContent = "Paused — tap to resume";
         } else {
+          liveUserPaused = false;
           audioCtx.resume();
           updateLiveStageUi(true, false);
           if (liveStatusEl) liveStatusEl.textContent = "playing";

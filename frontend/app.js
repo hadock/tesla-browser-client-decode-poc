@@ -1447,7 +1447,14 @@
       ["Dropped", String(d.framesDropped || 0), (d.framesDropped || 0) > 0 ? "warn" : "ok"],
       ["Ready Q", String(d.readyQ || 0), ""],
       ["Audio chunks", String(d.audioChunks || 0), ""],
-      ["Audio buffered", (d.audioBufferedMs != null ? d.audioBufferedMs + " ms" : "—"), ""],
+      ["Audio queued", (d.audioQueuedSec != null ? d.audioQueuedSec + " s" : "—"), ""],
+      ["Audio dec Q", String(d.audioDecQ || 0), ""],
+      ["Audio chunk Q", String(d.audioChunkQ || 0), ""],
+      ["Audio buffered", (d.audioBufferedMs != null ? d.audioBufferedMs + " ms" : "—"),
+        (d.audioBufferedMs != null && d.audioBufferedMs < 200 ? "warn" : "ok")],
+      ["Audio underruns", String(d.audioUnderruns || 0), (d.audioUnderruns || 0) > 0 ? "warn" : "ok"],
+      ["Audio last gap", (d.audioLastGapMs != null ? d.audioLastGapMs + " ms" : "—"),
+        (d.audioLastGapMs || 0) > 150 ? "warn" : "ok"],
       ["Buffer", (d.bufferMs != null ? d.bufferMs + " ms" : "—"), ""],
       ["A/V drift", (d.driftMs != null ? d.driftMs + " ms" : "—"), Math.abs(d.driftMs || 0) > 120 ? "warn" : "ok"],
       ["<video> els", String(d.videoEls || 0), d.videoEls ? "bad" : "ok"],
@@ -1595,7 +1602,9 @@
       mp4box: typeof MP4Box !== "undefined",
       stage: "idle", segmentsFetched: 0, framesDecoded: 0, framesDrawn: 0,
       framesShown: 0, framesLate: 0, framesDropped: 0, readyQ: 0,
-      audioChunks: 0, bufferMs: 0, driftMs: 0, audioBufferedMs: 0,
+      audioChunks: 0, audioQueuedSec: 0, audioDecQ: 0, audioChunkQ: 0,
+      audioUnderruns: 0, audioLastGapMs: 0,
+      bufferMs: 0, driftMs: 0, audioBufferedMs: 0,
       videoEls: 0, audioEls: 0, error: null
     });
     if (btnLiveStop) btnLiveStop.addEventListener("click", function () { stopLive(); });

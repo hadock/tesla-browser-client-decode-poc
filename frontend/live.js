@@ -183,7 +183,11 @@
     this._readyQueue = [];
     this._encodePending = [];
     this._chunkQueue = [];
+    this._audioChunkQueue = [];
     this._encodeBusy = false;
+    this._audioUnderrunOpen = false;
+    this._audioUnderrunStart = 0;
+    this._lastAudioMediaTs = null;
     this._encodeCanvas = null;
     this._encodeCtx = null;
     this._displayW = 0;
@@ -215,6 +219,8 @@
       segmentsFetched: 0, framesDecoded: 0, framesDrawn: 0, framesShown: 0,
       framesLate: 0, framesDropped: 0, audioChunks: 0,
       bufferMs: 0, driftMs: 0, audioBufferedMs: 0, readyQ: 0,
+      audioQueuedSec: 0, audioDecQ: 0, audioChunkQ: 0,
+      audioUnderruns: 0, audioLastGapMs: 0,
       error: null, videoEls: 0, audioEls: 0
     };
   };
@@ -253,6 +259,7 @@
       try { this._encodePending.shift().frame.close(); } catch (_) {}
     }
     this._chunkQueue = [];
+    this._audioChunkQueue = [];
     while (this._readyQueue.length) {
       var r = this._readyQueue.shift();
       if (r && r.url && String(r.url).indexOf("blob:") === 0) {
@@ -261,6 +268,9 @@
     }
     this._encodeBusy = false;
     this._encodeInFlight = 0;
+    this._audioUnderrunOpen = false;
+    this._audioUnderrunStart = 0;
+    this._lastAudioMediaTs = null;
     while (this._audioQueue.length) { try { this._audioQueue.shift().close(); } catch (_) {} }
     this._started = false;
     this._setStage("stopped");
@@ -302,7 +312,11 @@
     this._readyQueue = [];
     this._encodePending = [];
     this._chunkQueue = [];
+    this._audioChunkQueue = [];
     this._encodeBusy = false;
+    this._audioUnderrunOpen = false;
+    this._audioUnderrunStart = 0;
+    this._lastAudioMediaTs = null;
     this._encodeInFlight = 0;
     this._audioQueue = [];
     this._closeDecoders();
@@ -639,9 +653,8 @@
           output: function (audioData) {
             if (self._aborted(gen)) { audioData.close(); return; }
             self.diag.audioChunks++;
-            // Never drop oldest — that caused ~1–2s of audio then silence.
-            // Soft safety cap only; decode backpressure keeps this small.
-            if (self._audioQueue.length >= 400) {
+            // Soft safety only — kickAudioDecode backpressures first.
+            if (self._audioQueue.length >= 800) {
               try { audioData.close(); } catch (_) {}
               return;
             }
@@ -676,7 +689,36 @@
       configureAudio(info, file);
       file.start();
     };
+    // Audio is first-class: never drop encoded AAC. Queue it and feed the
+    // AudioDecoder from the paint loop. The old `decodeQueueSize > 40 ||
+    // ahead > 2.5s → continue` path discarded ~9s of every 10s muxed segment
+    // whenever the main thread was busy JPEG-encoding video (~1s audio / ~7s
+    // silence).
+    var MAX_AUDIO_DECODED_SEC = 6;
+    var MAX_AUDIO_SCHEDULE_SEC = 4;
+    var MAX_AUDIO_DEC_Q = 12;
+
+    function audioDecodedSec() {
+      return audioQueueAheadUs() / 1e6;
+    }
+
+    function kickAudioDecode() {
+      if (!self._audioDec || self._audioDec.state !== "configured") return;
+      while (self._audioChunkQueue.length &&
+             self._audioDec.decodeQueueSize < MAX_AUDIO_DEC_Q &&
+             audioDecodedSec() < MAX_AUDIO_DECODED_SEC) {
+        var ach = self._audioChunkQueue.shift();
+        try { self._audioDec.decode(ach); }
+        catch (e) { self._emit("warn", "live_audio_decode", { msg: e.message }); }
+      }
+      self.diag.audioDecQ = self._audioDec ? self._audioDec.decodeQueueSize : 0;
+      self.diag.audioChunkQ = self._audioChunkQueue.length;
+      self.diag.audioQueuedSec = Math.round(audioDecodedSec() * 100) / 100;
+    }
+
     function kickDecode() {
+      // Audio first — never let video backpressure starve AAC.
+      kickAudioDecode();
       if (!self._videoDec || self._videoDec.state !== "configured") return;
       while (self._chunkQueue.length &&
              readyDepth() < MAX_ENCODE_AHEAD &&
@@ -689,10 +731,25 @@
 
     file.onSamples = function (id, user, list) {
       var i, s, timescale;
+      // Service audio samples in this batch before video so a mixed MP4Box
+      // callback cannot fill the video chunk queue and delay AAC queuing.
+      for (i = 0; i < list.length; i++) {
+        s = list[i];
+        if (user === "audio" && self._audioDec && self._audioDec.state === "configured") {
+          timescale = audioTrackInfo.timescale || 44100;
+          try {
+            self._audioChunkQueue.push(new EncodedAudioChunk({
+              type: "key",
+              timestamp: (s.cts * 1e6) / timescale,
+              duration: (s.duration * 1e6) / timescale,
+              data: s.data
+            }));
+          } catch (e) { self._emit("warn", "live_audio_decode", { msg: e.message }); }
+        }
+      }
       for (i = 0; i < list.length; i++) {
         s = list[i];
         if (user === "video" && self._videoDec && self._videoDec.state === "configured") {
-          // Never drop encoded samples — queue and let kickDecode apply backpressure.
           timescale = videoTrackInfo.timescale || 1000;
           try {
             self._chunkQueue.push(new EncodedVideoChunk({
@@ -702,18 +759,6 @@
               data: s.data
             }));
           } catch (e) { self._emit("warn", "live_decode", { msg: e.message }); }
-        } else if (user === "audio" && self._audioDec && self._audioDec.state === "configured") {
-          // Keep ~2.5s of decoded audio queued; more causes the old drop/stack bug.
-          if (audioQueueAheadUs() > 2.5e6 || self._audioDec.decodeQueueSize > 40) continue;
-          timescale = audioTrackInfo.timescale || 44100;
-          try {
-            self._audioDec.decode(new EncodedAudioChunk({
-              type: "key",
-              timestamp: (s.cts * 1e6) / timescale,
-              duration: (s.duration * 1e6) / timescale,
-              data: s.data
-            }));
-          } catch (_) {}
         }
       }
       kickDecode();
@@ -832,8 +877,15 @@
       for (i = 0; i < Math.min(candidates.length, cap); i++) {
         if (self._aborted(gen)) return added;
         // Pause video ingest while the encode/display pipeline is full so we
-        // never have to drop encoded chunks (drops = visible jumps).
-        if (!isAudio && (self._chunkQueue.length + readyDepth()) > 90) break;
+        // never have to drop encoded video chunks (drops = visible jumps).
+        // Still fetch when audio is starving so muxed AAC in the next segment
+        // can arrive (audio chunk queue is never dropped).
+        if (!isAudio && (self._chunkQueue.length + readyDepth()) > 90) {
+          var aStarve = !self._audioDec ||
+            ((self._audioChunkQueue.length + (self._audioQueue ? self._audioQueue.length : 0)) < 20 &&
+             (self.diag.audioBufferedMs || 0) < 500);
+          if (!aStarve) break;
+        }
         var s = prepareSeg(candidates[i].raw, offRef);
         seen[candidates[i].key] = true;
         seen[segKey(s)] = true;
@@ -890,51 +942,91 @@
     while (!this._aborted(gen)) {
       if (decoderError) throw decoderError;
 
-      // Gapless audio: chain buffers on AudioContext time. Do NOT drop oldest
-      // decoded chunks, and do NOT start late buffers at "now" (that stacked
-      // ~1–2s of audio then went silent). Timestamp discontinuities (TS PCR
-      // wrap / segment joins) are absorbed by the chain.
-      if (this._audioCtx && this._audioQueue.length) {
-        if (!this._nextAudioTime) {
-          this._nextAudioTime = this._audioCtx.currentTime + 0.08;
-          this._avStartCtx = this._nextAudioTime;
-          if (this._readyQueue.length && !this._videoOriginSet) {
-            this._videoOriginUs = this._readyQueue[0].ts;
-            this._videoOriginSet = true;
-          }
-          this._audioMediaStartUs = this._audioQueue[0].timestamp;
-          this._audioStartCtx = this._nextAudioTime;
-        }
-        while (this._audioQueue.length) {
-          // Keep ~1.25s scheduled ahead in the AudioContext graph
-          if (this._nextAudioTime > this._audioCtx.currentTime + 1.25) break;
-          // Underrun recovery: if we fell behind, nudge forward slightly
-          if (this._nextAudioTime < this._audioCtx.currentTime - 0.02) {
-            this._nextAudioTime = this._audioCtx.currentTime + 0.02;
-          }
-          var ad = this._audioQueue.shift();
-          try {
-            var nCh = ad.numberOfChannels, frames = ad.numberOfFrames, rate = ad.sampleRate;
-            var ab = this._audioCtx.createBuffer(nCh, frames, rate);
-            for (var ch = 0; ch < nCh; ch++) {
-              var tmp = new Float32Array(frames);
-              ad.copyTo(tmp, { planeIndex: ch, format: "f32-planar" });
-              ab.copyToChannel(tmp, ch);
+      // Gapless audio: chain buffers on AudioContext time. Audio decode is
+      // fed every tick (priority over video). Never drop encoded AAC.
+      // Media PTS discontinuities are absorbed by the chain (we schedule by
+      // duration, not by raw PTS). Large media gaps get a short silence pad
+      // so the graph stays continuous without a hard jump.
+      try { kickAudioDecode(); } catch (_) {}
+
+      if (this._audioCtx) {
+        if (this._audioQueue.length) {
+          if (!this._nextAudioTime) {
+            this._nextAudioTime = this._audioCtx.currentTime + 0.08;
+            this._avStartCtx = this._nextAudioTime;
+            if (this._readyQueue.length && !this._videoOriginSet) {
+              this._videoOriginUs = this._readyQueue[0].ts;
+              this._videoOriginSet = true;
             }
-            var src = this._audioCtx.createBufferSource();
-            src.buffer = ab;
-            src.connect(this._audioCtx.destination);
-            src.start(this._nextAudioTime);
-            this._nextAudioTime += ab.duration;
-            this._audioScheduledSec += ab.duration;
-          } catch (e) {
-            this._emit("warn", "live_audio_sched", { msg: e.message });
+            this._audioMediaStartUs = this._audioQueue[0].timestamp;
+            this._audioStartCtx = this._nextAudioTime;
+            this._lastAudioMediaTs = null;
           }
-          try { ad.close(); } catch (_) {}
+          while (this._audioQueue.length) {
+            if (this._nextAudioTime > this._audioCtx.currentTime + MAX_AUDIO_SCHEDULE_SEC) break;
+            // Underrun recovery: resume just ahead of now (no multi-second jump).
+            if (this._nextAudioTime < this._audioCtx.currentTime - 0.02) {
+              if (!this._audioUnderrunOpen) {
+                this._audioUnderrunOpen = true;
+                this._audioUnderrunStart = this._audioCtx.currentTime;
+                this.diag.audioUnderruns++;
+              }
+              this._nextAudioTime = this._audioCtx.currentTime + 0.02;
+            } else if (this._audioUnderrunOpen) {
+              this.diag.audioLastGapMs = Math.round(
+                (this._audioCtx.currentTime - this._audioUnderrunStart) * 1000
+              );
+              this._audioUnderrunOpen = false;
+            }
+            var ad = this._audioQueue.shift();
+            try {
+              // Pad short silence across large media PTS holes (segment joins)
+              // instead of skipping or jumping the AudioContext timeline.
+              if (this._lastAudioMediaTs != null) {
+                var mediaGapUs = ad.timestamp - this._lastAudioMediaTs;
+                if (mediaGapUs > 100000 && mediaGapUs < 2000000) {
+                  this._nextAudioTime += mediaGapUs / 1e6;
+                }
+              }
+              this._lastAudioMediaTs = ad.timestamp + (ad.duration || 0);
+              var nCh = ad.numberOfChannels, frames = ad.numberOfFrames, rate = ad.sampleRate;
+              var ab = this._audioCtx.createBuffer(nCh, frames, rate);
+              for (var ch = 0; ch < nCh; ch++) {
+                var tmp = new Float32Array(frames);
+                ad.copyTo(tmp, { planeIndex: ch, format: "f32-planar" });
+                ab.copyToChannel(tmp, ch);
+              }
+              var src = this._audioCtx.createBufferSource();
+              src.buffer = ab;
+              src.connect(this._audioCtx.destination);
+              src.start(this._nextAudioTime);
+              this._nextAudioTime += ab.duration;
+              this._audioScheduledSec += ab.duration;
+            } catch (e) {
+              this._emit("warn", "live_audio_sched", { msg: e.message });
+            }
+            try { ad.close(); } catch (_) {}
+          }
+        } else if (this._nextAudioTime) {
+          // Decoded queue empty — track underrun if schedule has run dry.
+          if (this._nextAudioTime < this._audioCtx.currentTime - 0.05) {
+            if (!this._audioUnderrunOpen) {
+              this._audioUnderrunOpen = true;
+              this._audioUnderrunStart = this._audioCtx.currentTime;
+              this.diag.audioUnderruns++;
+            }
+          }
         }
-        this.diag.audioBufferedMs = Math.max(0, Math.round(
-          (this._nextAudioTime - this._audioCtx.currentTime) * 1000
-        ));
+        if (this._nextAudioTime) {
+          this.diag.audioBufferedMs = Math.max(0, Math.round(
+            (this._nextAudioTime - this._audioCtx.currentTime) * 1000
+          ));
+        } else {
+          this.diag.audioBufferedMs = 0;
+        }
+        self.diag.audioDecQ = self._audioDec ? self._audioDec.decodeQueueSize : 0;
+        self.diag.audioChunkQ = self._audioChunkQueue.length;
+        self.diag.audioQueuedSec = Math.round(audioDecodedSec() * 100) / 100;
       }
 
       // Start picture clock once we have video (and audio has started if present).
@@ -1034,7 +1126,11 @@
             " bufMs=" + this.diag.bufferMs +
             " driftMs=" + this.diag.driftMs +
             " readyQ=" + this.diag.readyQ +
-            " chunkQ=" + (this._chunkQueue ? this._chunkQueue.length : 0),
+            " chunkQ=" + (this._chunkQueue ? this._chunkQueue.length : 0) +
+            " aChunkQ=" + this.diag.audioChunkQ +
+            " aBufMs=" + this.diag.audioBufferedMs +
+            " aUnderrun=" + this.diag.audioUnderruns +
+            " aGapMs=" + this.diag.audioLastGapMs,
           streamId: stream.id,
           framesDecoded: this.diag.framesDecoded,
           framesShown: this.diag.framesShown,
@@ -1048,6 +1144,7 @@
 
       if (vodDone && this._readyQueue.length === 0 && this._encodePending.length === 0 &&
           this._chunkQueue.length === 0 &&
+          this._audioChunkQueue.length === 0 &&
           this._audioQueue.length === 0 &&
           (!this._nextAudioTime || !this._audioCtx ||
             this._nextAudioTime <= this._audioCtx.currentTime + 0.05)) {
@@ -1071,7 +1168,9 @@
             if (media.endList && n === 0 && self._readyQueue.length === 0 &&
                 self._encodePending.length === 0 &&
                 self._chunkQueue.length === 0 &&
-                (!self._videoDec || self._videoDec.decodeQueueSize === 0)) {
+                self._audioChunkQueue.length === 0 &&
+                (!self._videoDec || self._videoDec.decodeQueueSize === 0) &&
+                (!self._audioDec || self._audioDec.decodeQueueSize === 0)) {
               vodDone = true;
             }
           }

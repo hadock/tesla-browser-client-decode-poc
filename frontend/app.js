@@ -1454,7 +1454,9 @@
       ["Decoded", String(d.framesDecoded || 0), ""],
       ["Drawn", String(d.framesDrawn || 0), ""],
       ["Audio chunks", String(d.audioChunks || 0), ""],
+      ["Audio buffered", (d.audioBufferedMs != null ? d.audioBufferedMs + " ms" : "—"), ""],
       ["Buffer", (d.bufferMs != null ? d.bufferMs + " ms" : "—"), ""],
+      ["A/V drift", (d.driftMs != null ? d.driftMs + " ms" : "—"), Math.abs(d.driftMs || 0) > 120 ? "warn" : "ok"],
       ["<video> els", String(d.videoEls || 0), d.videoEls ? "bad" : "ok"],
       ["<audio> els", String(d.audioEls || 0), d.audioEls ? "bad" : "ok"],
       ["Error", d.error || "—", d.error ? "bad" : "ok"]
@@ -1599,7 +1601,8 @@
       muxjs: typeof muxjs !== "undefined",
       mp4box: typeof MP4Box !== "undefined",
       stage: "idle", segmentsFetched: 0, framesDecoded: 0, framesDrawn: 0,
-      audioChunks: 0, bufferMs: 0, videoEls: 0, audioEls: 0, error: null
+      audioChunks: 0, bufferMs: 0, driftMs: 0, audioBufferedMs: 0,
+      videoEls: 0, audioEls: 0, error: null
     });
     if (btnLiveStop) btnLiveStop.addEventListener("click", function () { stopLive(); });
     if (liveStageEl) {

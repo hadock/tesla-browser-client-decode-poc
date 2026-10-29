@@ -184,9 +184,16 @@
     this._audioCtx = null;
     this._audioStartCtx = 0;
     this._audioMediaStartUs = 0;
+    this._nextAudioTime = 0;
+    this._avStartCtx = 0;
+    this._videoOriginUs = 0;
+    this._videoOriginSet = false;
+    this._ptsOffsetUs = 0;
+    this._lastRawPtsUs = null;
     this._mediaStartUs = 0;
     this._wallStart = 0;
     this._started = false;
+    this._audioScheduledSec = 0;
     this.diag = this._freshDiag();
   }
 
@@ -198,7 +205,8 @@
       mp4box: typeof MP4Box !== "undefined",
       streamId: null, stage: "idle", variant: "", format: "",
       segmentsFetched: 0, framesDecoded: 0, framesDrawn: 0, audioChunks: 0,
-      bufferMs: 0, error: null, videoEls: 0, audioEls: 0
+      bufferMs: 0, driftMs: 0, audioBufferedMs: 0,
+      error: null, videoEls: 0, audioEls: 0
     };
   };
 
@@ -262,6 +270,13 @@
     this._started = false;
     this._audioStartCtx = 0;
     this._audioMediaStartUs = 0;
+    this._nextAudioTime = 0;
+    this._avStartCtx = 0;
+    this._videoOriginUs = 0;
+    this._videoOriginSet = false;
+    this._ptsOffsetUs = 0;
+    this._lastRawPtsUs = null;
+    this._audioScheduledSec = 0;
     this._frameQueue = [];
     this._audioQueue = [];
     this._closeDecoders();
@@ -355,6 +370,53 @@
       return null;
     }
 
+    function getAudioDescription(mp4file, trackId) {
+      var trak = mp4file.getTrackById(trackId);
+      if (!trak) return null;
+      var entries = (((trak.mdia || {}).minf || {}).stbl || {}).stsd
+        ? trak.mdia.minf.stbl.stsd.entries : [];
+      for (var i = 0; i < (entries || []).length; i++) {
+        var entry = entries[i];
+        var esds = entry.esds;
+        if (!esds && entry.boxes) {
+          for (var bi = 0; bi < entry.boxes.length; bi++) {
+            if (entry.boxes[bi].type === "esds") { esds = entry.boxes[bi]; break; }
+          }
+        }
+        if (!esds) continue;
+        // Prefer the raw AudioSpecificConfig when mp4box exposes it
+        try {
+          if (esds.esd && esds.esd.descs) {
+            for (var di = 0; di < esds.esd.descs.length; di++) {
+              var d = esds.esd.descs[di];
+              if (d.descs) {
+                for (var dj = 0; dj < d.descs.length; dj++) {
+                  if (d.descs[dj].data) return d.descs[dj].data;
+                }
+              }
+              if (d.data) return d.data;
+            }
+          }
+        } catch (_) {}
+        if (esds.data) return esds.data;
+        if (typeof DataStream === "undefined") continue;
+        try {
+          var stream = new DataStream();
+          stream.endianness = DataStream.BIG_ENDIAN;
+          esds.write(stream);
+          return new Uint8Array(stream.buffer, 8);
+        } catch (_) {}
+      }
+      return null;
+    }
+
+    function audioQueueAheadUs() {
+      if (!self._audioQueue.length) return 0;
+      var a0 = self._audioQueue[0];
+      var aN = self._audioQueue[self._audioQueue.length - 1];
+      return Math.max(0, (aN.timestamp + (aN.duration || 0)) - a0.timestamp);
+    }
+
     function configureVideo(info, mp4file) {
       if (videoConfigured || !info.videoTracks.length) return;
       videoTrackInfo = info.videoTracks[0];
@@ -367,14 +429,34 @@
         output: function (frame) {
           if (self._aborted(gen)) { frame.close(); return; }
           self.diag.framesDecoded++;
-          // Keep frames near the playhead. If we are already buffered, drop this
-          // (newest) frame instead of discarding the oldest — otherwise VOD
-          // decode-ahead leaves the queue stuck in the future and nothing paints.
+          // Remap PTS discontinuities (TS segment joins / PCR jumps) onto a
+          // continuous timeline so the audio-locked clock does not stall or
+          // skip. A jump >0.5s relative to the prior frame is treated as a
+          // discontinuity; smaller gaps (B-frame reorder) pass through.
+          var rawTs = frame.timestamp;
+          if (self._lastRawPtsUs != null) {
+            var delta = rawTs - self._lastRawPtsUs;
+            if (delta > 500000 || delta < -500000) {
+              var expect = frame.duration || 33333;
+              self._ptsOffsetUs += (self._lastRawPtsUs + expect) - rawTs;
+            }
+          }
+          self._lastRawPtsUs = rawTs;
+          var adjTs = rawTs + self._ptsOffsetUs;
+          try {
+            if (typeof frame.timestamp !== "undefined") {
+              // VideoFrame.timestamp is readonly; wrap via queue sidecar.
+            }
+          } catch (_) {}
           if (self._frameQueue.length >= 45) {
             try { frame.close(); } catch (_) {}
             return;
           }
-          self._frameQueue.push(frame);
+          // Store adjusted PTS on a sidecar; paint loop reads .__ts || .timestamp
+          frame.__ts = adjTs;
+          var q = self._frameQueue, ts = adjTs, ii = q.length;
+          while (ii > 0 && (q[ii - 1].__ts != null ? q[ii - 1].__ts : q[ii - 1].timestamp) > ts) ii--;
+          q.splice(ii, 0, frame);
         },
         error: function (e) {
           decoderError = e;
@@ -398,20 +480,26 @@
           output: function (audioData) {
             if (self._aborted(gen)) { audioData.close(); return; }
             self.diag.audioChunks++;
-            self._audioQueue.push(audioData);
-            while (self._audioQueue.length > 40) {
-              try { self._audioQueue.shift().close(); } catch (_) {}
+            // Never drop oldest — that caused ~1–2s of audio then silence.
+            // Soft safety cap only; decode backpressure keeps this small.
+            if (self._audioQueue.length >= 400) {
+              try { audioData.close(); } catch (_) {}
+              return;
             }
+            self._audioQueue.push(audioData);
           },
           error: function (e) {
             self._emit("warn", "live_audio_dec", { msg: String(e && (e.message || e)) });
           }
         });
-        self._audioDec.configure({
+        var aConfig = {
           codec: codec,
           numberOfChannels: (audioTrackInfo.audio && audioTrackInfo.audio.channel_count) || 2,
           sampleRate: (audioTrackInfo.audio && audioTrackInfo.audio.sample_rate) || 48000
-        });
+        };
+        var aDesc = getAudioDescription(mp4file, audioTrackInfo.id);
+        if (aDesc) aConfig.description = aDesc;
+        self._audioDec.configure(aConfig);
         mp4file.setExtractionOptions(audioTrackInfo.id, "audio", { nbSamples: 50 });
         audioConfigured = true;
         if (ensureAudioCtx) {
@@ -447,10 +535,12 @@
             }));
           } catch (e) { self._emit("warn", "live_decode", { msg: e.message }); }
         } else if (user === "audio" && self._audioDec && self._audioDec.state === "configured") {
+          // Keep ~2.5s of decoded audio queued; more causes the old drop/stack bug.
+          if (audioQueueAheadUs() > 2.5e6 || self._audioDec.decodeQueueSize > 40) continue;
           timescale = audioTrackInfo.timescale || 44100;
           try {
             self._audioDec.decode(new EncodedAudioChunk({
-              type: s.is_sync ? "key" : "delta",
+              type: "key",
               timestamp: (s.cts * 1e6) / timescale,
               duration: (s.duration * 1e6) / timescale,
               data: s.data
@@ -618,7 +708,158 @@
     while (!this._aborted(gen)) {
       if (decoderError) throw decoderError;
 
-      // Refresh + pull periodically
+      // Gapless audio: chain buffers on AudioContext time. Do NOT drop oldest
+      // decoded chunks, and do NOT start late buffers at "now" (that stacked
+      // ~1–2s of audio then went silent). Timestamp discontinuities (TS PCR
+      // wrap / segment joins) are absorbed by the chain.
+      if (this._audioCtx && this._audioQueue.length) {
+        if (!this._nextAudioTime) {
+          this._nextAudioTime = this._audioCtx.currentTime + 0.08;
+          this._avStartCtx = this._nextAudioTime;
+          if (this._frameQueue.length && !this._videoOriginSet) {
+            var f0 = this._frameQueue[0];
+            this._videoOriginUs = f0.__ts != null ? f0.__ts : f0.timestamp;
+            this._videoOriginSet = true;
+          }
+          this._audioMediaStartUs = this._audioQueue[0].timestamp;
+          this._audioStartCtx = this._nextAudioTime;
+        }
+        while (this._audioQueue.length) {
+          // Keep ~1.25s scheduled ahead in the AudioContext graph
+          if (this._nextAudioTime > this._audioCtx.currentTime + 1.25) break;
+          // Underrun recovery: if we fell behind, nudge forward slightly
+          if (this._nextAudioTime < this._audioCtx.currentTime - 0.02) {
+            this._nextAudioTime = this._audioCtx.currentTime + 0.02;
+          }
+          var ad = this._audioQueue.shift();
+          try {
+            var nCh = ad.numberOfChannels, frames = ad.numberOfFrames, rate = ad.sampleRate;
+            var ab = this._audioCtx.createBuffer(nCh, frames, rate);
+            for (var ch = 0; ch < nCh; ch++) {
+              var tmp = new Float32Array(frames);
+              ad.copyTo(tmp, { planeIndex: ch, format: "f32-planar" });
+              ab.copyToChannel(tmp, ch);
+            }
+            var src = this._audioCtx.createBufferSource();
+            src.buffer = ab;
+            src.connect(this._audioCtx.destination);
+            src.start(this._nextAudioTime);
+            this._nextAudioTime += ab.duration;
+            this._audioScheduledSec += ab.duration;
+          } catch (e) {
+            this._emit("warn", "live_audio_sched", { msg: e.message });
+          }
+          try { ad.close(); } catch (_) {}
+        }
+        this.diag.audioBufferedMs = Math.max(0, Math.round(
+          (this._nextAudioTime - this._audioCtx.currentTime) * 1000
+        ));
+      }
+
+      // Start picture clock once we have video (and audio has started if present).
+      if (!this._started) {
+        var haveAudio = !!(this._audioCtx && this._audioStartCtx);
+        var needAudio = !!this._audioDec;
+        if (this._frameQueue.length && (!needAudio || haveAudio)) {
+          this._started = true;
+          if (!this._videoOriginSet) {
+            var vf0 = this._frameQueue[0];
+            this._videoOriginUs = vf0.__ts != null ? vf0.__ts : vf0.timestamp;
+            this._videoOriginSet = true;
+          }
+          this._mediaStartUs = this._videoOriginUs;
+          this._wallStart = performance.now();
+          if (!this._avStartCtx) {
+            // Video-only: wall clock
+            this._avStartCtx = 0;
+          }
+        } else {
+          await this._wait(20);
+          continue;
+        }
+      }
+
+      // Picture at real-time 1x, locked to AudioContext when audio is playing.
+      // Late frames are dropped; future frames wait. Snap ONLY on a true PTS
+      // discontinuity (queue head >> clock). Chasing the decode frontier caused
+      // the timelapse.
+      var nowVideoUs;
+      var elapsedUs;
+      if (this._audioCtx && this._avStartCtx) {
+        elapsedUs = (this._audioCtx.currentTime - this._avStartCtx) * 1e6;
+        nowVideoUs = this._videoOriginUs + elapsedUs;
+      } else {
+        elapsedUs = (performance.now() - this._wallStart) * 1000;
+        nowVideoUs = this._videoOriginUs + elapsedUs;
+      }
+
+      function frameTs(f) { return f.__ts != null ? f.__ts : f.timestamp; }
+
+      // Safety net if remap missed a jump (should be rare).
+      if (this._frameQueue.length) {
+        var headTs = frameTs(this._frameQueue[0]);
+        if (headTs > nowVideoUs + 750000) {
+          this._videoOriginUs = headTs - elapsedUs;
+          nowVideoUs = headTs;
+        }
+      }
+
+      while (this._frameQueue.length > 1 && frameTs(this._frameQueue[1]) <= nowVideoUs) {
+        try { this._frameQueue.shift().close(); } catch (_) {} // drop late
+      }
+      if (this._frameQueue.length && frameTs(this._frameQueue[0]) <= nowVideoUs + 40000) {
+        var fr = this._frameQueue.shift();
+        try {
+          this.diag.driftMs = Math.round((frameTs(fr) - nowVideoUs) / 1000);
+          scratchCtx.drawImage(fr, 0, 0, scratch.width, scratch.height);
+          fr.close();
+          this.diag.framesDrawn++;
+          if (pushFrame) {
+            try { var p = pushFrame(gen); if (p && p.then) p.catch(function () {}); } catch (_) {}
+          }
+        } catch (e) {
+          try { fr.close(); } catch (_) {}
+          this._emit("warn", "live_paint", { msg: e && e.message || String(e) });
+        }
+      }
+
+      var newest = this._frameQueue.length ? frameTs(this._frameQueue[this._frameQueue.length - 1]) : nowVideoUs;
+      this.diag.bufferMs = Math.max(0, Math.round((newest - nowVideoUs) / 1000));
+      if (this.opts.onHud) {
+        this.opts.onHud({
+          time: Math.max(0, elapsedUs / 1e6),
+          framesDrawn: this.diag.framesDrawn,
+          framesDecoded: this.diag.framesDecoded,
+          bufferMs: this.diag.bufferMs,
+          driftMs: this.diag.driftMs
+        });
+      }
+      if (performance.now() - lastBeat > 4000) {
+        lastBeat = performance.now();
+        this._countEls();
+        if (this.opts.onDiag) this.opts.onDiag(this.diag);
+        this._emit("info", "live_heartbeat", {
+          msg: "decoded=" + this.diag.framesDecoded + " drawn=" + this.diag.framesDrawn +
+            " segs=" + this.diag.segmentsFetched + " bufMs=" + this.diag.bufferMs +
+            " driftMs=" + this.diag.driftMs + " aBufMs=" + this.diag.audioBufferedMs,
+          streamId: stream.id,
+          framesDecoded: this.diag.framesDecoded,
+          framesDrawn: this.diag.framesDrawn,
+          bufferMs: this.diag.bufferMs,
+          driftMs: this.diag.driftMs,
+          audioBufferedMs: this.diag.audioBufferedMs
+        });
+      }
+
+      if (vodDone && this._frameQueue.length === 0 &&
+          this._audioQueue.length === 0 &&
+          (!this._nextAudioTime || !this._audioCtx ||
+            this._nextAudioTime <= this._audioCtx.currentTime + 0.05)) {
+        this._setStage("ended");
+        break;
+      }
+
+      // Network pull AFTER A/V so a slow transmux cannot stall audio/picture.
       if (performance.now() - lastPull > (media.endList ? 500 : Math.max(1000, media.targetDuration * 400))) {
         lastPull = performance.now();
         try {
@@ -638,106 +879,6 @@
           this._emit("warn", "live_pull", { msg: e.message });
           if (!this._started) throw e;
         }
-      }
-
-      // Audio schedule — independent media timeline from video so separate
-      // HLS audio playlists (Apple fMP4) do not desync and drop all frames.
-      if (this._audioCtx && this._audioQueue.length) {
-        if (!this._audioStartCtx) {
-          this._audioStartCtx = this._audioCtx.currentTime + 0.05;
-          this._audioMediaStartUs = this._audioQueue[0].timestamp;
-        }
-        while (this._audioQueue.length) {
-          var ad = this._audioQueue[0];
-          var when = this._audioStartCtx + (ad.timestamp - this._audioMediaStartUs) / 1e6;
-          if (when > this._audioCtx.currentTime + 1.2) break;
-          this._audioQueue.shift();
-          try {
-            var nCh = ad.numberOfChannels, frames = ad.numberOfFrames, rate = ad.sampleRate;
-            var ab = this._audioCtx.createBuffer(nCh, frames, rate);
-            for (var ch = 0; ch < nCh; ch++) {
-              var tmp = new Float32Array(frames);
-              ad.copyTo(tmp, { planeIndex: ch, format: "f32-planar" });
-              ab.copyToChannel(tmp, ch);
-            }
-            var src = this._audioCtx.createBufferSource();
-            src.buffer = ab;
-            src.connect(this._audioCtx.destination);
-            src.start(Math.max(when, this._audioCtx.currentTime));
-          } catch (e) {
-            this._emit("warn", "live_audio_sched", { msg: e.message });
-          }
-          ad.close();
-        }
-      }
-
-      // Picture clock is always driven by the first video frame + wall time.
-      if (!this._started && this._frameQueue.length) {
-        this._started = true;
-        this._mediaStartUs = this._frameQueue[0].timestamp;
-        this._wallStart = performance.now();
-      }
-      if (!this._started) {
-        await this._wait(20);
-        continue;
-      }
-
-      var nowUs = this._mediaStartUs + (performance.now() - this._wallStart) * 1000;
-
-      // If the oldest queued frame is far ahead of the clock, we dropped the
-      // near-term frames (decode-ahead). Snap the clock to the queue head.
-      if (this._frameQueue.length && this._frameQueue[0].timestamp > nowUs + 250000) {
-        this._mediaStartUs = this._frameQueue[0].timestamp;
-        this._wallStart = performance.now();
-        nowUs = this._mediaStartUs;
-      }
-
-      while (this._frameQueue.length > 1 && this._frameQueue[1].timestamp <= nowUs) {
-        try { this._frameQueue.shift().close(); } catch (_) {}
-      }
-      if (this._frameQueue.length && this._frameQueue[0].timestamp <= nowUs + 80000) {
-        var fr = this._frameQueue.shift();
-        try {
-          scratchCtx.drawImage(fr, 0, 0, scratch.width, scratch.height);
-          fr.close();
-          this.diag.framesDrawn++;
-          // JPEG encode is async and must not stall the A/V clock.
-          if (pushFrame) {
-            try { var p = pushFrame(gen); if (p && p.then) p.catch(function () {}); } catch (_) {}
-          }
-        } catch (e) {
-          try { fr.close(); } catch (_) {}
-          this._emit("warn", "live_paint", { msg: e && e.message || String(e) });
-        }
-      }
-
-      var newest = this._frameQueue.length ? this._frameQueue[this._frameQueue.length - 1].timestamp : nowUs;
-      this.diag.bufferMs = Math.max(0, Math.round((newest - nowUs) / 1000));
-      if (this.opts.onHud) {
-        this.opts.onHud({
-          time: Math.max(0, (nowUs - this._mediaStartUs) / 1e6),
-          framesDrawn: this.diag.framesDrawn,
-          framesDecoded: this.diag.framesDecoded,
-          bufferMs: this.diag.bufferMs
-        });
-      }
-      if (performance.now() - lastBeat > 4000) {
-        lastBeat = performance.now();
-        this._countEls();
-        if (this.opts.onDiag) this.opts.onDiag(this.diag);
-        this._emit("info", "live_heartbeat", {
-          msg: "decoded=" + this.diag.framesDecoded + " drawn=" + this.diag.framesDrawn +
-            " segs=" + this.diag.segmentsFetched + " bufMs=" + this.diag.bufferMs,
-          streamId: stream.id,
-          framesDecoded: this.diag.framesDecoded,
-          framesDrawn: this.diag.framesDrawn,
-          bufferMs: this.diag.bufferMs
-        });
-      }
-
-      if (vodDone && this._frameQueue.length === 0) {
-        this._setStage("ended");
-        break;
       }
       await this._wait(8);
     }

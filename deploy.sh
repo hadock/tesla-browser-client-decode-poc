@@ -11,9 +11,11 @@ Usage: ./deploy.sh <aws|cloudflare> [mode] [options]
        TARGET=<aws|cloudflare> ./deploy.sh [mode] [options]
 
 Targets
-  cloudflare   One Worker + Workers Static Assets (SPA, /videos, /packs) and
+  cloudflare   One Worker + Workers Static Assets (SPA, /videos, /packs).
+               With ENABLE_LOGS=1 the page also posts debug logs to
                POST /api/logs -> Workers Logs. No AWS resources.
-  aws          CloudFormation: S3 + CloudFront (OAC) + API Gateway + Lambda
+  aws          CloudFormation: S3 + CloudFront (OAC). That is all playback needs.
+               With ENABLE_LOGS=1 it adds HTTP API + Lambda + log group for
                POST /api/logs -> CloudWatch Logs (+ saved Insights queries).
 
 Modes
@@ -24,6 +26,10 @@ Modes
 Common options
   --env-file FILE        Load KEY=VALUE settings first (default: .deploy.env.local
                          if it exists; it is gitignored). Real env vars win.
+  --enable-logs          [ENABLE_LOGS=1] browser posts debug logs to /api/logs
+                         (AWS: also creates the log Lambda/API/log group).
+  --no-logs              [ENABLE_LOGS=0] default. Playback is fully client-side;
+                         logs stay in the browser console + on-page Debug panel.
   -h, --help             Show this help.
 
 Cloudflare options (env var in brackets)
@@ -45,14 +51,16 @@ AWS options (env var in brackets)
   --expected-account ID  [EXPECTED_AWS_ACCOUNT]  optional guard: refuse to deploy
                          if the caller identity is a different account.
 
-The browser always posts logs to the relative path /api/logs on both targets.
+Logging is optional (ENABLE_LOGS, default 0). When on, the browser posts to the
+relative path /api/logs on both targets; when off it never calls it.
 
 Examples
   ./deploy.sh cloudflare
   CUSTOM_DOMAIN=poc.example.com ./deploy.sh cloudflare
   ./deploy.sh cloudflare dry-run            # build + wrangler deploy --dry-run
   AWS_PROFILE=poc ./deploy.sh aws validate  # template validation only
-  ./deploy.sh aws --expected-account 123456789012
+  ./deploy.sh aws --expected-account 123456789012   # S3 + CloudFront only
+  ENABLE_LOGS=1 ./deploy.sh aws                       # + Lambda log endpoint
 USAGE
 }
 
@@ -74,6 +82,8 @@ while [[ $# -gt 0 ]]; do
     --log-group) OVR+=("LOG_GROUP_NAME=$2"); shift ;;
     --bucket-prefix) OVR+=("BUCKET_PREFIX=$2"); shift ;;
     --expected-account) OVR+=("EXPECTED_AWS_ACCOUNT=$2"); shift ;;
+    --enable-logs) OVR+=("ENABLE_LOGS=1") ;;
+    --no-logs) OVR+=("ENABLE_LOGS=0") ;;
     -*) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
     *) [[ -z "$MODE" ]] && MODE="$1" || { echo "unexpected argument: $1" >&2; exit 2; } ;;
   esac
@@ -95,6 +105,13 @@ if [[ -n "$ENV_FILE" ]]; then
   echo "Loaded settings from $(basename "$ENV_FILE")"
 fi
 for kv in "${OVR[@]+"${OVR[@]}"}"; do export "$kv"; done
+
+# Normalise ENABLE_LOGS to 1/0 (default 0 = no remote logging).
+case "$(printf '%s' "${ENABLE_LOGS:-0}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on) export ENABLE_LOGS=1 ;;
+  0|false|no|off|"") export ENABLE_LOGS=0 ;;
+  *) echo "ENABLE_LOGS must be 1 or 0 (got: ${ENABLE_LOGS})" >&2; exit 2 ;;
+esac
 
 case "$TARGET" in
   cloudflare) exec "$ROOT/scripts/deploy-cloudflare.sh" "${MODE:-all}" ;;

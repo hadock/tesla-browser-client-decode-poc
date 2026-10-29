@@ -60,7 +60,7 @@
     <section class="caps" id="caps">
       <h3>Capability probe <span class="caps-hint">(screenshot from the car)</span></h3>
       <div class="caps-grid" id="capsGrid"></div>
-      <div class="session-line">Session <code id="sessionIdDisplay">—</code> · search it in Workers Logs</div>
+      <div class="session-line">Session <code id="sessionIdDisplay">—</code> · <span id="logDest">remote logs off</span></div>
     </section>
 
     <section class="debug-controls">
@@ -89,7 +89,7 @@
       <label class="url-label">Paste a video URL (debug)
         <input id="urlInput" type="url" placeholder="https://example.com/clip.mp4 (needs CORS)" />
       </label>
-      <p class="hint">Packs are JPEG+PCM, zero &lt;video&gt;. WebCodecs may probe green but hang on Tesla Chromium. Flags: <code>?pack=1</code> (autostart) <code>?wc=1</code> <code>?allowVideo=1</code>. Debug logs → <code>/api/logs</code>.</p>
+      <p class="hint">Packs are JPEG+PCM, zero &lt;video&gt;. WebCodecs may probe green but hang on Tesla Chromium. Flags: <code>?pack=1</code> (autostart) <code>?wc=1</code> <code>?allowVideo=1</code>. Optional remote debug logs → <code>/api/logs</code> (deploy with <code>ENABLE_LOGS=1</code>); <code>?logs=0</code> turns them off for one visit.</p>
     </section>
   </details>
 

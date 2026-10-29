@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Cloudflare target. Normally run via: ./deploy.sh cloudflare [all|build|config|dry-run]
-# Inputs (env): WORKER_NAME, CUSTOM_DOMAIN (optional), CLOUDFLARE_ACCOUNT_ID (optional).
+# Inputs (env): WORKER_NAME, CUSTOM_DOMAIN (optional), CLOUDFLARE_ACCOUNT_ID (optional),
+#   ENABLE_LOGS (1|0, default 0: the page does not post to /api/logs; the Worker
+#   route stays but is simply unused).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CF="$ROOT/cloudflare"
@@ -11,6 +13,7 @@ MODE="${1:-all}"
 export WORKER_NAME="${WORKER_NAME:-tesla-client-decode-poc}"
 export CUSTOM_DOMAIN="${CUSTOM_DOMAIN:-}"
 export CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-}"
+case "${ENABLE_LOGS:-0}" in 1|true|yes|on) ENABLE_LOGS=1; LOGS_JS=true ;; *) ENABLE_LOGS=0; LOGS_JS=false ;; esac
 
 case "$MODE" in all|build|config|dry-run) ;; *) echo "cloudflare modes: all|build|config|dry-run" >&2; exit 2 ;; esac
 [[ "$WORKER_NAME" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "invalid WORKER_NAME" >&2; exit 2; }
@@ -28,6 +31,7 @@ build() {
   cat > "$DIST/config.js" <<JS
 /* Runtime config - generated at deploy time (cloudflare target) */
 window.POC_CONFIG = {
+  logsEnabled: ${LOGS_JS},
   logsUrl: "/api/logs",
   webCodecsTimeoutMs: 10000,
   logTarget: "cloudflare",
@@ -61,7 +65,7 @@ H
   if grep -rlE "cloudfront\.net|amazonaws\.com" "$DIST" --include=*.js --include=*.html --include=*.json; then
     echo "AWS URL found in dist" >&2; exit 1
   fi
-  echo "==> dist: $(find "$DIST" -type f | wc -l) files, $(du -sh "$DIST" | cut -f1)"
+  echo "==> dist: $(find "$DIST" -type f | wc -l) files, $(du -sh "$DIST" | cut -f1)  remote logs: $([[ $ENABLE_LOGS == 1 ]] && echo on || echo off)"
 }
 
 gen_config
@@ -73,4 +77,4 @@ if [[ "$MODE" == "dry-run" ]]; then npx wrangler deploy --dry-run; exit 0; fi
 npx wrangler deploy
 echo
 if [[ -n "$CUSTOM_DOMAIN" ]]; then echo "Live: https://$CUSTOM_DOMAIN/"; else echo "Live: the workers.dev URL printed above"; fi
-echo "Logs: (cd cloudflare && npx wrangler tail $WORKER_NAME --format pretty --search <sessionId>)"
+[[ "$ENABLE_LOGS" == 1 ]] && echo "Logs: (cd cloudflare && npx wrangler tail $WORKER_NAME --format pretty --search <sessionId>)" || echo "Remote logs: off (ENABLE_LOGS=0)"

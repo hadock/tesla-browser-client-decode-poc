@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # AWS target. Normally run via: ./deploy.sh aws [mode]
-#   CloudFormation (S3 + CloudFront OAC + API Gateway + Lambda) + S3 sync + Insights queries.
-# Inputs (env): STACK_NAME, AWS_REGION/AWS_DEFAULT_REGION, AWS_PROFILE (standard AWS chain),
+#   Base: CloudFormation S3 + CloudFront (OAC) + S3 sync. That is all playback needs.
+#   ENABLE_LOGS=1 adds the optional debug-log endpoint: HTTP API + Lambda + log group
+#   (+ saved Logs Insights queries). The Lambda only receives browser logs.
+# Inputs (env): ENABLE_LOGS (1|0, default 0), STACK_NAME, AWS_REGION/AWS_DEFAULT_REGION, AWS_PROFILE (standard AWS chain),
 #   LOG_GROUP_NAME (default /<stack>/browser), BUCKET_PREFIX (optional),
 #   EXPECTED_AWS_ACCOUNT (optional guard). Nothing account-specific is stored in the repo.
 set -euo pipefail
@@ -11,6 +13,7 @@ STACK="${STACK_NAME:-tesla-browser-client-decode-poc}"
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 export AWS_REGION="$REGION"
 MODE="${1:-all}"
+case "${ENABLE_LOGS:-0}" in 1|true|yes|on) ENABLE_LOGS=1; LOGS_CFN=true ;; *) ENABLE_LOGS=0; LOGS_CFN=false ;; esac
 LOG_GROUP_NAME="${LOG_GROUP_NAME:-/${STACK}/browser}"
 BUCKET_PREFIX="${BUCKET_PREFIX:-}"
 QUERY_PREFIX="${QUERY_PREFIX:-tesla-client-decode}"
@@ -28,9 +31,15 @@ case "$MODE" in
   *) echo "aws modes: all|stack|frontend|videos|packs|invalidate|lambda|queries|validate|dry-run" >&2; exit 2 ;;
 esac
 
-echo "Stack=$STACK Region=$REGION Mode=$MODE LogGroup=$LOG_GROUP_NAME BucketPrefix=${BUCKET_PREFIX:-<auto>}"
+if [[ "$ENABLE_LOGS" == 1 ]]; then LOG_DESC="on ($LOG_GROUP_NAME)"; else LOG_DESC="off (S3 + CloudFront only)"; fi
+echo "Stack=$STACK Region=$REGION Mode=$MODE Logs=$LOG_DESC BucketPrefix=${BUCKET_PREFIX:-<auto>}"
 
-CFN_PARAMS=(ProjectName="$STACK" LogGroupName="$LOG_GROUP_NAME" BucketPrefix="$BUCKET_PREFIX")
+if [[ "$ENABLE_LOGS" != 1 && ( "$MODE" == "lambda" || "$MODE" == "queries" ) ]]; then
+  echo "Mode '$MODE' needs the log endpoint: set ENABLE_LOGS=1 (or --enable-logs)." >&2
+  exit 2
+fi
+
+CFN_PARAMS=(EnableLogs="$LOGS_CFN" ProjectName="$STACK" LogGroupName="$LOG_GROUP_NAME" BucketPrefix="$BUCKET_PREFIX")
 
 if [[ "$MODE" == "validate" ]]; then
   aws cloudformation validate-template --template-body "file://$ROOT/infra/template.yaml" \
@@ -94,14 +103,17 @@ PYZ
 }
 
 write_config() {
+  local CFG_LOG_GROUP=""
+  [[ "$ENABLE_LOGS" == 1 ]] && CFG_LOG_GROUP="$LOG_GROUP_NAME"
   mkdir -p "$STATE"
   cat > "$STATE/config.js" <<EOF
 /* Runtime config - generated at deploy time (aws target) */
 window.POC_CONFIG = {
+  logsEnabled: ${LOGS_CFN},
   logsUrl: "/api/logs",
   webCodecsTimeoutMs: 10000,
   logTarget: "aws",
-  logGroup: "${LOG_GROUP_NAME}"
+  logGroup: "${CFG_LOG_GROUP}"
 };
 EOF
 }
@@ -290,11 +302,14 @@ BUCKET=$(stack_out BucketName)
 DIST=$(stack_out DistributionId)
 DOMAIN=$(stack_out DistributionDomain)
 URL=$(stack_out SiteURL)
-FN=$(stack_out LogIngestFnName)
-LG=$(stack_out BrowserLogGroup)
-echo "Bucket=$BUCKET Dist=$DIST URL=$URL Fn=$FN LogGroup=$LG"
+FN=""; LG=""
+if [[ "$ENABLE_LOGS" == 1 ]]; then
+  FN=$(stack_out LogIngestFnName)
+  LG=$(stack_out BrowserLogGroup)
+fi
+echo "Bucket=$BUCKET Dist=$DIST URL=$URL${FN:+ Fn=$FN}${LG:+ LogGroup=$LG}"
 
-if [[ "$MODE" == "all" || "$MODE" == "lambda" || "$MODE" == "stack" ]]; then
+if [[ "$ENABLE_LOGS" == 1 ]] && [[ "$MODE" == "all" || "$MODE" == "lambda" || "$MODE" == "stack" ]]; then
   if [[ -n "$FN" && "$FN" != "None" ]]; then
     update_lambda "$FN"
   else
@@ -302,7 +317,7 @@ if [[ "$MODE" == "all" || "$MODE" == "lambda" || "$MODE" == "stack" ]]; then
   fi
 fi
 
-if [[ "$MODE" == "all" || "$MODE" == "queries" || "$MODE" == "stack" ]]; then
+if [[ "$ENABLE_LOGS" == 1 ]] && [[ "$MODE" == "all" || "$MODE" == "queries" || "$MODE" == "stack" ]]; then
   ensure_queries
 fi
 
@@ -319,15 +334,19 @@ if [[ "$MODE" == "all" || "$MODE" == "frontend" || "$MODE" == "invalidate" ]]; t
   invalidate "$DIST"
 fi
 
-if [[ "$MODE" == "all" || "$MODE" == "frontend" ]]; then
+if [[ "$ENABLE_LOGS" == 1 ]] && [[ "$MODE" == "all" || "$MODE" == "frontend" ]]; then
   sleep 5
   test_logs_api "$URL"
 fi
 
 echo
 echo "Live: $URL"
-echo "Log group: $LG"
 echo "Force pack: ${URL}?pack=1"
+if [[ "$ENABLE_LOGS" != 1 ]]; then
+  echo "Remote logs: off (ENABLE_LOGS=0) — S3 + CloudFront only; logs stay in the browser console / Debug panel."
+  exit 0
+fi
+echo "Log group: $LG"
 FAIL_ID=$(cat "$ROOT/.deploy/${QUERY_FAIL_NAME}.id" 2>/dev/null || echo "?")
 SESS_ID=$(cat "$ROOT/.deploy/${QUERY_SESSION_NAME}.id" 2>/dev/null || echo "?")
 echo "Insights query: $QUERY_FAIL_NAME id=$FAIL_ID"

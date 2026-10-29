@@ -14,6 +14,8 @@
   const TRY_WC = params.get("wc") === "1"; // opt-in: WebCodecs first (car stalls; pack is default)
   const CFG = window.POC_CONFIG || {};
   const LOGS_URL = CFG.logsUrl || "/api/logs";
+  // Remote debug logs are optional (ENABLE_LOGS at deploy time). Off => console + Debug panel only.
+  const LOGS_ENABLED = CFG.logsEnabled === true && params.get("logs") !== "0";
   const WC_TIMEOUT_MS = CFG.webCodecsTimeoutMs || 10000;
 
   const SESSION_ID = (function () {
@@ -108,7 +110,8 @@
   let switchToken = 0;      // latest playlist tap wins
   function isAborted(gen) { return stopRequested || gen !== playGen; }
 
-  /* ---------- client logger: POST /api/logs (CloudWatch on AWS, Workers Logs on Cloudflare) ---------- */
+  /* ---------- client logger: console always; POST /api/logs only when LOGS_ENABLED
+   * (CloudWatch on AWS, Workers Logs on Cloudflare). Playback never depends on it. ---------- */
   const logQueue = [];
   let flushTimer = null;
   let flushing = false;
@@ -131,6 +134,7 @@
       else if (level === "warn") console.warn(line, row);
       else console.log(line, row);
     } catch (_) {}
+    if (!LOGS_ENABLED) return;
     logQueue.push(row);
     if (logQueue.length >= 20) flushLogs();
     else if (!flushTimer) flushTimer = setTimeout(flushLogs, 2000);
@@ -138,7 +142,7 @@
 
   function flushLogs() {
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
-    if (!logQueue.length || flushing) return;
+    if (!LOGS_ENABLED || !logQueue.length || flushing) return;
     flushing = true;
     const batch = logQueue.splice(0, 100);
     const body = JSON.stringify({ sessionId: SESSION_ID, lines: batch });
@@ -364,6 +368,13 @@
   /* ---------- Capability probe ---------- */
   function renderCaps() {
     if (sessionIdDisplay) sessionIdDisplay.textContent = SESSION_ID;
+    const logDest = $("logDest");
+    if (logDest) {
+      logDest.textContent = !LOGS_ENABLED ? "remote logs off (console only)"
+        : CFG.logTarget === "aws" ? "search it in CloudWatch Logs" + (CFG.logGroup ? " (" + CFG.logGroup + ")" : "")
+        : CFG.logTarget === "cloudflare" ? "search it in Workers Logs"
+        : "logs → " + LOGS_URL;
+    }
     const rows = [
       ["VideoDecoder", hasVideoDecoder],
       ["AudioDecoder", hasAudioDecoder],

@@ -27,11 +27,15 @@ playback while the vehicle is in Drive. That control does **not** extend to:
 2. Playing PCM (or other) audio through the Web Audio API.
 
 This repository is a short, self-contained proof that the gap can be exploited
-**entirely client-side**: the page loads an MP4 from the same origin, decodes
-it in the browser (WebCodecs when available; by default a pre-built JPEG
-frame pack, so no `<video>` element is ever created), and presents the result as JPEG frames in an `<img>` plus
-Web Audio PCM. No `<video>` element is ever shown to the user. No Lambda /
-WebSocket streamer is required.
+**entirely client-side**: a static host serves files, and everything else
+happens in the browser. The default player (the one that works in the car)
+fetches a pre-built JPEG frame pack in 20-frame chunks plus raw PCM audio,
+shows the frames in an `<img>` and plays the PCM through Web Audio, with the
+audio clock driving the picture. An opt-in path (`?wc=1`) instead decodes the
+same-origin MP4 with WebCodecs into a canvas. No `<video>` element is created
+in either case. No server-side processing, Lambda, or WebSocket streamer is
+involved in playback; the only optional backend is a debug-log endpoint
+(`ENABLE_LOGS=1`, off by default) that receives browser logs.
 
 ## Impact
 
@@ -60,8 +64,8 @@ submission time (Controls → Software).
 
 1. Park. Open a normal HTML5 video page in the in-car browser; confirm it
    does **not** play in Drive (control baseline).
-2. Deploy with `./deploy.sh cloudflare` or `./deploy.sh aws` (see README) and
-   open `https://<your-deployment>/`.
+2. Deploy with `./deploy.sh cloudflare` or `./deploy.sh aws` (see README; the
+   minimal AWS deploy is S3 + CloudFront) and open `https://<your-deployment>/`.
 3. Tap a clip in the playlist (default: JPEG pack player).
 4. With a passenger operating the browser and filming, shift to **Drive**. Observe: frames advance in the `<img>`, audio is
    audible, lips/instruments stay aligned. The HUD reports

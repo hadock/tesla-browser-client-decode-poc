@@ -1,9 +1,17 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Tesla browser client-decode PoC — SPA + /videos + /packs behind CloudFront,
-  plus same-origin POST /api/logs → Lambda → CloudWatch Logs.
+  Tesla browser client-decode PoC — SPA + /videos + /packs in S3 behind CloudFront (OAC).
+  Playback is fully client-side. Optional (EnableLogs=true): same-origin
+  POST /api/logs → HTTP API → Lambda → CloudWatch Logs, for debug logs only.
 
 Parameters:
+  EnableLogs:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      true = also create the optional debug-log endpoint (HTTP API + Lambda + log group,
+      CloudFront /api/* behavior). false = S3 + CloudFront only.
   ProjectName:
     Type: String
     Default: tesla-browser-client-decode-poc
@@ -18,6 +26,7 @@ Parameters:
     Description: Optional S3 bucket name prefix (bucket = <prefix>-<ProjectName>). Empty = CloudFormation-generated name.
 
 Conditions:
+  LogsEnabled: !Equals [!Ref EnableLogs, "true"]
   DefaultLogGroup: !Equals [!Ref LogGroupName, ""]
   AutoBucketName: !Equals [!Ref BucketPrefix, ""]
 
@@ -70,12 +79,14 @@ Resources:
         Description: OAC for client-decode PoC bucket
 
   BrowserLogGroup:
+    Condition: LogsEnabled
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !If [DefaultLogGroup, !Sub "/${ProjectName}/browser", !Ref LogGroupName]
       RetentionInDays: 14
 
   LogIngestRole:
+    Condition: LogsEnabled
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -102,6 +113,7 @@ Resources:
                   - !Sub "${BrowserLogGroup.Arn}:*"
 
   LogIngestFn:
+    Condition: LogsEnabled
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${ProjectName}-log-ingest"
@@ -116,9 +128,10 @@ Resources:
       Code:
         ZipFile: |
           def handler(event, context):
-              return {"statusCode": 503, "headers": {"content-type": "application/json"}, "body": "{"error":"pending code upload"}"}
+              return {"statusCode": 503, "headers": {"content-type": "application/json"}, "body": '{"error":"pending code upload"}'}
 
   LogHttpApi:
+    Condition: LogsEnabled
     Type: AWS::ApiGatewayV2::Api
     Properties:
       Name: !Sub "${ProjectName}-logs"
@@ -130,6 +143,7 @@ Resources:
         MaxAge: 86400
 
   LogIngestIntegration:
+    Condition: LogsEnabled
     Type: AWS::ApiGatewayV2::Integration
     Properties:
       ApiId: !Ref LogHttpApi
@@ -139,6 +153,7 @@ Resources:
       IntegrationMethod: POST
 
   LogRoutePost:
+    Condition: LogsEnabled
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref LogHttpApi
@@ -146,6 +161,7 @@ Resources:
       Target: !Sub "integrations/${LogIngestIntegration}"
 
   LogRouteOptions:
+    Condition: LogsEnabled
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref LogHttpApi
@@ -153,6 +169,7 @@ Resources:
       Target: !Sub "integrations/${LogIngestIntegration}"
 
   LogStage:
+    Condition: LogsEnabled
     Type: AWS::ApiGatewayV2::Stage
     Properties:
       ApiId: !Ref LogHttpApi
@@ -160,6 +177,7 @@ Resources:
       AutoDeploy: true
 
   LogIngestPermission:
+    Condition: LogsEnabled
     Type: AWS::Lambda::Permission
     Properties:
       Action: lambda:InvokeFunction
@@ -172,7 +190,7 @@ Resources:
     Properties:
       DistributionConfig:
         Enabled: true
-        Comment: !Sub "${ProjectName} SPA + /videos + /packs + /api/logs"
+        Comment: !If [LogsEnabled, !Sub "${ProjectName} SPA + /videos + /packs + /api/logs", !Sub "${ProjectName} SPA + /videos + /packs"]
         DefaultRootObject: index.html
         HttpVersion: http2
         IPV6Enabled: true
@@ -183,12 +201,15 @@ Resources:
             OriginAccessControlId: !GetAtt OriginAccessControl.Id
             S3OriginConfig:
               OriginAccessIdentity: ""
-          - Id: LogsApiOrigin
-            DomainName: !Sub "${LogHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
-            CustomOriginConfig:
-              HTTPSPort: 443
-              OriginProtocolPolicy: https-only
-              OriginSSLProtocols: [TLSv1.2]
+          - !If
+            - LogsEnabled
+            - Id: LogsApiOrigin
+              DomainName: !Sub "${LogHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+              CustomOriginConfig:
+                HTTPSPort: 443
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols: [TLSv1.2]
+            - !Ref "AWS::NoValue"
         DefaultCacheBehavior:
           TargetOriginId: S3Origin
           ViewerProtocolPolicy: redirect-to-https
@@ -198,16 +219,19 @@ Resources:
           CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
           OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
         CacheBehaviors:
-          - PathPattern: api/*
-            TargetOriginId: LogsApiOrigin
-            ViewerProtocolPolicy: https-only
-            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
-            CachedMethods: [GET, HEAD]
-            Compress: true
-            # CachingDisabled
-            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
-            # AllViewerExceptHostHeader — Host must be the API Gateway domain
-            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - !If
+            - LogsEnabled
+            - PathPattern: api/*
+              TargetOriginId: LogsApiOrigin
+              ViewerProtocolPolicy: https-only
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+              CachedMethods: [GET, HEAD]
+              Compress: true
+              # CachingDisabled
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              # AllViewerExceptHostHeader — Host must be the API Gateway domain
+              OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            - !Ref "AWS::NoValue"
           - PathPattern: packs/*
             TargetOriginId: S3Origin
             ViewerProtocolPolicy: redirect-to-https
@@ -243,6 +267,8 @@ Resources:
             ErrorCachingMinTTL: 0
 
 Outputs:
+  LogsEnabled:
+    Value: !Ref EnableLogs
   BucketName:
     Value: !Ref MediaBucket
   DistributionId:
@@ -252,10 +278,14 @@ Outputs:
   SiteURL:
     Value: !Sub "https://${Distribution.DomainName}"
   BrowserLogGroup:
+    Condition: LogsEnabled
     Value: !Ref BrowserLogGroup
   LogIngestUrl:
+    Condition: LogsEnabled
     Value: !Sub "https://${Distribution.DomainName}/api/logs"
   LogApiEndpoint:
+    Condition: LogsEnabled
     Value: !Sub "https://${LogHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
   LogIngestFnName:
+    Condition: LogsEnabled
     Value: !Ref LogIngestFn

@@ -14,9 +14,11 @@ submission associated with this finding, or email `you@example.com`
 
 - Demonstrates client-side decode of an MP4 into JPEG `<img>` frames +
   Web Audio PCM, with no visible `<video>` element.
-- Static site (Cloudflare Worker + Static Assets, or S3 + CloudFront) plus a
-  same-origin debug-log endpoint. No user accounts; logs carry a random
-  per-page session id and the browser user agent only.
+- Static site (Cloudflare Worker + Static Assets, or S3 + CloudFront).
+  Playback and decoding run entirely in the browser. An optional same-origin
+  debug-log endpoint (`ENABLE_LOGS=1`, off by default) only receives logs;
+  no user accounts; logs carry a random per-page session id and the browser
+  user agent only.
 - Source media is CC BY 3.0; attribution is displayed.
 
 ## Disclaimer

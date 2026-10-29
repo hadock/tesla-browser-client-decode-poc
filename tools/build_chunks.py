@@ -6,15 +6,15 @@ packs/<slug>/chunks/c0000.bin = concatenated JPEGs; byte lengths go in manifest.
   "chunks": [{"file": "c0000.bin", "first": 0, "lengths": [..]}, ...],
   "chunks_prefix": "/packs/<slug>/chunks/"
 Per-frame files stay in place (older clients / ?chunks=0 still work).
-Usage: tools/build_chunks.py [packs_dir] [frames_per_chunk]
+tools/build_packs.py calls chunk_pack() for you; run this directly to re-chunk.
+Usage: tools/build_chunks.py [packs_dir] [frames_per_chunk] [slug ...]
 """
 import json, sys
 from pathlib import Path
 
-root = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "packs")
-per = int(sys.argv[2]) if len(sys.argv) > 2 else 20
 
-for slug_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+def chunk_pack(slug_dir: Path, per: int = 20) -> dict:
+    """(Re)build slug_dir/chunks/*.bin and the chunk index in slug_dir/manifest.json."""
     mpath = slug_dir / "manifest.json"
     m = json.loads(mpath.read_text())
     frames = m["frames"]
@@ -37,4 +37,21 @@ for slug_dir in sorted(p for p in root.iterdir() if p.is_dir()):
     mpath.write_text(json.dumps(m, separators=(",", ":")))
     total = sum(sum(c["lengths"]) for c in chunks)
     print(f"{slug_dir.name}: {len(frames)} frames -> {len(chunks)} chunks, {total/1e6:.1f} MB, "
-          f"avg {total/len(chunks)/1e3:.0f} KB/chunk")
+          f"avg {total/max(len(chunks), 1)/1e3:.0f} KB/chunk")
+    return m
+
+
+def main(argv):
+    root = Path(argv[1] if len(argv) > 1 else Path(__file__).resolve().parent.parent / "packs")
+    per = int(argv[2]) if len(argv) > 2 else 20
+    only = set(argv[3:])
+    for slug_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        if only and slug_dir.name not in only:
+            continue
+        if not (slug_dir / "manifest.json").is_file():
+            continue
+        chunk_pack(slug_dir, per)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

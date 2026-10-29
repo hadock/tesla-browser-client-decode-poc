@@ -18,3 +18,5 @@ media/*.mp4
 .deploy.env.*.local
 cloudflare/wrangler.jsonc
 .wrangler/
+__pycache__/
+*.pyc

@@ -24,22 +24,38 @@ elements) while the vehicle is in Drive. That control does **not** extend to:
    (or redrawing a `<canvas>`), and
 2. Playing PCM audio through the Web Audio API.
 
-The sibling PoC streams frames over WSS from Lambda. This one needs only a
-static host plus an optional log endpoint.
+The sibling PoC streams frames over WSS from Lambda. This one needs **only a
+static host**: playback and decoding are fully client-side. Nothing on the
+server touches the media.
+
+**What runs where**
+
+| Piece | Role | Needed? |
+|---|---|---|
+| Static files (SPA, `/packs`, `/videos`) | everything playback needs | **yes** |
+| Image packs (`/packs/<slug>/`, chunked) | default player — **the one that works in the car** | yes |
+| MP4s (`/videos/<slug>.mp4`, not chunked) | only the opt-in WebCodecs path (`?wc=1`), which stalls in the Tesla browser | optional |
+| `POST /api/logs` (AWS: API Gateway + Lambda → CloudWatch; Cloudflare: Worker → Workers Logs) | **debug logs only** — never serves or processes media | optional, `ENABLE_LOGS=1` |
+
+The minimal AWS deploy is just **S3 + CloudFront** (`ENABLE_LOGS=0`, the
+default). On Cloudflare the Worker always runs (it adds byte-range support for
+`/videos`); with `ENABLE_LOGS=0` the page simply never posts to `/api/logs`.
 
 ## Architecture
 
 ```
 Static host (Cloudflare Worker + Static Assets, or AWS CloudFront + S3)
   /                       SPA (index.html, app.js, styles.css, catalog.json)
-  /packs/<slug>/...       JPEG frame packs (20-frame chunks) + PCM audio   ← default player
-  /videos/<slug>.mp4      H.264/AAC source clips (byte-range capable)      ← WebCodecs path
-  POST /api/logs          browser debug logs → Workers Logs | CloudWatch Logs
+  /packs/<slug>/...       JPEG frame packs (20-frame chunks) + PCM audio   ← default player (works in the car)
+  /videos/<slug>.mp4      H.264/AAC source clips, not chunked              ← opt-in WebCodecs path (?wc=1)
+  POST /api/logs          OPTIONAL (ENABLE_LOGS=1): browser debug logs only
+                          → Workers Logs | Lambda → CloudWatch Logs
          │ same-origin (no CORS)
          ▼
 Browser (Tesla in-car / desktop)
   Default:  pack player → <img> + Web Audio (audio clock drives the picture)
-  Optional: WebCodecs VideoDecoder → canvas → JPEG <img>
+  Opt-in:   ?wc=1 WebCodecs VideoDecoder → canvas → JPEG <img>
+  All fetching, decoding, timing and rendering happen here, in the browser.
 ```
 
 ## Hosted clips (CC BY 3.0 — not MIT)
@@ -67,14 +83,19 @@ an untracked env file (`.deploy.env.local`, gitignored — see
 
 ```bash
 ./deploy.sh --help
-./deploy.sh cloudflare [all|build|config|dry-run] [--worker-name N] [--custom-domain HOST] [--account-id ID]
+./deploy.sh cloudflare [all|build|config|dry-run] [--worker-name N] [--custom-domain HOST] [--account-id ID] [--enable-logs|--no-logs]
 ./deploy.sh aws [all|stack|frontend|videos|packs|lambda|queries|invalidate|validate|dry-run] \
-               [--stack N] [--region R] [--profile P] [--log-group G] [--bucket-prefix X] [--expected-account ID]
+               [--stack N] [--region R] [--profile P] [--log-group G] [--bucket-prefix X] [--expected-account ID] [--enable-logs|--no-logs]
 TARGET=cloudflare ./deploy.sh          # same thing via env
 ```
 
-Prerequisites: local `media/*.mp4` and `packs/<slug>/` (build chunks with
-`python3 tools/build_chunks.py`). Both are gitignored.
+| Variable | Default | Notes |
+|---|---|---|
+| `ENABLE_LOGS` | `0` | `1` = the page posts debug logs to `/api/logs` (AWS also creates the HTTP API + Lambda + log group). `0` = no remote logging; logs stay in the browser console and the on-page Debug panel. Playback is identical either way. |
+
+Prerequisites: local `media/*.mp4` and `packs/<slug>/` — build each pack from
+its mp4 with `tools/build_packs.py` (see [Building packs](#building-image-packs-from-an-mp4)).
+Both folders are gitignored.
 
 ### Cloudflare (recommended: no AWS resources)
 
@@ -93,29 +114,38 @@ one DNS record and certificate; no other record is touched.
 | --- | --- |
 | `/`, `/app.js`, `/catalog.json`, `/vendor/*`, `/packs/**` | Workers Static Assets |
 | `/videos/<slug>.mp4` | Worker → Static Assets, with byte-range support (`206`/`416`) |
-| `POST /api/logs` | Worker → Workers Logs (one structured JSON entry per browser log line) |
+| `POST /api/logs` | Worker → Workers Logs (one structured JSON entry per browser log line). Only called when deployed with `ENABLE_LOGS=1`. |
 
-Reading logs: Dashboard → **Workers & Pages → `<WORKER_NAME>` → Observability → Logs**,
+Reading logs (`ENABLE_LOGS=1`): Dashboard → **Workers & Pages → `<WORKER_NAME>` → Observability → Logs**,
 filter `sessionId = <id shown in the page's Debug panel>`; or live:
 `cd cloudflare && npx wrangler tail <WORKER_NAME> --format pretty --search <sessionId>`.
 
-### AWS (CloudFront + S3 + API Gateway + Lambda + CloudWatch)
+### AWS (S3 + CloudFront; optional log Lambda)
+
+With the default `ENABLE_LOGS=0` the CloudFormation stack is only **S3 +
+CloudFront (OAC)** — 4 resources, no API Gateway, no Lambda, no log group.
+With `ENABLE_LOGS=1` the template's `LogsEnabled` condition adds the
+debug-log endpoint: HTTP API + Lambda (`backend/logs/handler.py`, which only
+writes the posted log lines to CloudWatch) + log group + the CloudFront
+`/api/*` behavior, plus saved Logs Insights queries. Switching an existing
+stack from 1 to 0 deletes those log resources (and the log group).
 
 | Variable | Default | Notes |
 |---|---|---|
+| `ENABLE_LOGS` | `0` | See above. `lambda` / `queries` modes require `1`. |
 | `AWS_PROFILE` / `AWS_REGION` | standard AWS chain / `us-east-1` | Any standard AWS credential source works. |
 | `STACK_NAME` | `tesla-browser-client-decode-poc` | CloudFormation stack and resource name prefix. |
-| `LOG_GROUP_NAME` | `/<STACK_NAME>/browser` | CloudWatch log group for browser logs. |
+| `LOG_GROUP_NAME` | `/<STACK_NAME>/browser` | CloudWatch log group for browser logs (`ENABLE_LOGS=1` only). |
 | `BUCKET_PREFIX` | — | Optional; bucket becomes `<prefix>-<STACK_NAME>`. Unset → CloudFormation-generated name. |
 | `EXPECTED_AWS_ACCOUNT` | — | Optional safety guard: refuse to deploy to any other account. |
-| `QUERY_PREFIX` | `tesla-client-decode` | Name prefix for the saved Logs Insights queries. |
+| `QUERY_PREFIX` | `tesla-client-decode` | Name prefix for the saved Logs Insights queries (`ENABLE_LOGS=1` only). |
 
 `./deploy.sh aws validate` only validates the template; `./deploy.sh aws dry-run`
 creates a CloudFormation change set without executing it. Saved query IDs and
 the generated `config.js` are written to `.deploy/` (gitignored). The site URL
 is the CloudFront domain printed at the end (`https://<your-deployment>`).
 
-Saved Logs Insights queries: `<prefix>-car-failures` (timeouts, decoder
+Saved Logs Insights queries (`ENABLE_LOGS=1` only): `<prefix>-car-failures` (timeouts, decoder
 errors, pack fallbacks, errors), `<prefix>-session` (paste a `sessionId`),
 `<prefix>-heartbeat` (pack-player trend: `lagMs`, `bufAheadMs`,
 `loadP50`/`loadP95`, `kbps`, `inflight`, `liveImgs`, `heapMB`, `rebuffers`,
@@ -136,8 +166,38 @@ errors, pack fallbacks, errors), `<prefix>-session` (paste a `sessionId`),
 ```bash
 cd frontend
 ln -sfn ../media videos && ln -sfn ../packs packs
-python3 -m http.server 8080      # http://127.0.0.1:8080/  (POST /api/logs will 501 locally)
+python3 -m http.server 8080      # http://127.0.0.1:8080/
 ```
+
+The committed `frontend/config.js` has `logsEnabled: false`, so the local page
+never posts logs. Deploys write their own `config.js` from `ENABLE_LOGS`;
+`?logs=0` turns remote logging off for a single visit.
+
+## Building image packs from an mp4
+
+The car plays **image packs**, not the mp4s. Build one per clip:
+
+```bash
+python3 tools/build_packs.py media/myclip.mp4 myclip                  # whole file
+python3 tools/build_packs.py source.webm myclip --start 50 --duration 70   # trim
+python3 tools/build_packs.py media/myclip.mp4 myclip --force          # rebuild
+```
+
+It runs ffmpeg and writes `packs/<slug>/` in exactly the format the player
+expects: `frames/000000.jpg…` (10 fps, 480 px wide, mjpeg `-q:v 5`),
+`audio.pcm` (s16le, mono, 24 kHz; silence if the input has no audio track),
+`manifest.json`, then bundles the frames into `chunks/c####.bin` (20 JPEGs
+each, byte lengths in the manifest) via `tools/build_chunks.py`. Options:
+`--fps`, `--width`, `--jpeg-q`, `--audio-rate`, `--chunk-frames`,
+`--packs-dir`. Needs `ffmpeg` and `ffprobe` on PATH. A 70 s clip builds in a
+couple of seconds and is ~23 MB (~10 MB of chunks).
+
+Then add an entry to `frontend/catalog.json` (`slug`, `title`, `pack:
+"/packs/<slug>/manifest.json"`, `src: "/videos/<slug>.mp4"`, license and
+attribution) and redeploy. Keep each clip's mp4 in `media/` only if you want the
+`?wc=1` WebCodecs path for it; the pack player does not use it. The playlist
+thumbnail is the pack's middle frame. `python3 tools/build_chunks.py [packs_dir] [frames] [slug…]`
+re-chunks existing packs.
 
 ## Pack player (Drive-safe path)
 
@@ -153,13 +213,13 @@ of drifting. `?chunks=0` forces one request per frame.
 
 ```
 deploy.sh                    single entry point: ./deploy.sh <aws|cloudflare>
-scripts/deploy-aws.sh        AWS target (CloudFormation + S3 + Lambda + Insights queries)
+scripts/deploy-aws.sh        AWS target (CloudFormation S3 + CloudFront; + log Lambda/queries if ENABLE_LOGS=1)
 scripts/deploy-cloudflare.sh Cloudflare target (build dist + generate wrangler config + deploy)
 cloudflare/                  Worker (src/worker.js) + wrangler.template.jsonc
-infra/template.yaml          CloudFormation (S3 + CloudFront OAC + HTTP API + Lambda + log group)
-backend/logs/handler.py      Lambda: POST /api/logs → CloudWatch Logs
+infra/template.yaml          CloudFormation: S3 + CloudFront OAC; HTTP API + Lambda + log group only if EnableLogs=true
+backend/logs/handler.py      optional log Lambda: POST /api/logs → CloudWatch Logs (debug logs only, no media)
 frontend/                    SPA (index.html, app.js, styles.css, catalog.json, vendor/mp4box)
-tools/                       build_chunks.py (frame packs), gen_wrangler.py
+tools/                       build_packs.py (mp4 → frame pack), build_chunks.py (re-chunk), gen_wrangler.py
 media/, packs/               local source clips and frame packs (gitignored)
 ```
 

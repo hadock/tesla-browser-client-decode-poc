@@ -78,7 +78,7 @@ Media stays on the third-party CDN; nothing is rehosted:
 | Apple HLS example (fMP4) | VOD fMP4 | Official [Apple HLS example](https://developer.apple.com/streaming/examples/) | `https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8` |
 
 Open with `?tab=live`. On-screen **Live diagnostics** show WebCodecs support,
-frames decoded/drawn, audio buffered, A/V drift (ms), buffer, and errors.
+frames decoded/shown/late/dropped, ready queue, audio buffered, A/V drift (ms), buffer, and errors. Picture is hold-don't-skip: JPEG frames are decoded ahead into a ready queue and presented in order against the audio clock (never drop the head to catch up).
 Picture is locked to the `AudioContext` clock at 1× (late frames are dropped,
 not sped up); audio is scheduled gapless so TS PTS discontinuities do not
 starve the graph. Live HLS **requires WebCodecs**;

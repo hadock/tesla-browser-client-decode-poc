@@ -180,6 +180,14 @@
     this._videoDec = null;
     this._audioDec = null;
     this._frameQueue = [];
+    this._readyQueue = [];
+    this._encodePending = [];
+    this._chunkQueue = [];
+    this._encodeBusy = false;
+    this._encodeCanvas = null;
+    this._encodeCtx = null;
+    this._displayW = 0;
+    this._displayH = 0;
     this._audioQueue = [];
     this._audioCtx = null;
     this._audioStartCtx = 0;
@@ -204,8 +212,9 @@
       muxjs: typeof muxjs !== "undefined",
       mp4box: typeof MP4Box !== "undefined",
       streamId: null, stage: "idle", variant: "", format: "",
-      segmentsFetched: 0, framesDecoded: 0, framesDrawn: 0, audioChunks: 0,
-      bufferMs: 0, driftMs: 0, audioBufferedMs: 0,
+      segmentsFetched: 0, framesDecoded: 0, framesDrawn: 0, framesShown: 0,
+      framesLate: 0, framesDropped: 0, audioChunks: 0,
+      bufferMs: 0, driftMs: 0, audioBufferedMs: 0, readyQ: 0,
       error: null, videoEls: 0, audioEls: 0
     };
   };
@@ -240,6 +249,18 @@
     while ((t = this._timers.pop())) clearTimeout(t);
     this._closeDecoders();
     while (this._frameQueue.length) { try { this._frameQueue.shift().close(); } catch (_) {} }
+    while (this._encodePending.length) {
+      try { this._encodePending.shift().frame.close(); } catch (_) {}
+    }
+    this._chunkQueue = [];
+    while (this._readyQueue.length) {
+      var r = this._readyQueue.shift();
+      if (r && r.url && String(r.url).indexOf("blob:") === 0) {
+        try { URL.revokeObjectURL(r.url); } catch (_) {}
+      }
+    }
+    this._encodeBusy = false;
+    this._encodeInFlight = 0;
     while (this._audioQueue.length) { try { this._audioQueue.shift().close(); } catch (_) {} }
     this._started = false;
     this._setStage("stopped");
@@ -278,6 +299,11 @@
     this._lastRawPtsUs = null;
     this._audioScheduledSec = 0;
     this._frameQueue = [];
+    this._readyQueue = [];
+    this._encodePending = [];
+    this._chunkQueue = [];
+    this._encodeBusy = false;
+    this._encodeInFlight = 0;
     this._audioQueue = [];
     this._closeDecoders();
     this.diag = this._freshDiag();
@@ -417,22 +443,168 @@
       return Math.max(0, (aN.timestamp + (aN.duration || 0)) - a0.timestamp);
     }
 
+    var MAX_READY = 48;
+    var MAX_ENCODE_AHEAD = 24;
+    var MAX_DISPLAY_W = 426;
+    var JPEG_Q = 0.35;
+
+    function frameTs(f) {
+      return f.__ts != null ? f.__ts : f.timestamp;
+    }
+
+    function ensureEncodeCanvas(srcW, srcH) {
+      var w = srcW, h = srcH;
+      if (w > MAX_DISPLAY_W) {
+        h = Math.round(h * (MAX_DISPLAY_W / w));
+        w = MAX_DISPLAY_W;
+      }
+      // Even dims help some JPEG encoders
+      if (w & 1) w--;
+      if (h & 1) h--;
+      if (!self._encodeCanvas) {
+        self._encodeCanvas = document.createElement("canvas");
+        self._encodeCtx = self._encodeCanvas.getContext("2d", { alpha: false, desynchronized: true });
+      }
+      if (self._encodeCanvas.width !== w || self._encodeCanvas.height !== h) {
+        self._encodeCanvas.width = w;
+        self._encodeCanvas.height = h;
+      }
+      self._displayW = w;
+      self._displayH = h;
+      if (scratch.width !== w || scratch.height !== h) {
+        scratch.width = w;
+        scratch.height = h;
+      }
+      return self._encodeCtx;
+    }
+
+    function readyDepth() {
+      return self._readyQueue.length + self._encodePending.length;
+    }
+
+    // Two encode canvases so we can draw the next frame while the previous
+    // toBlob is still running (JPEG encode is the slow step).
+    var ENCODE_SLOTS = 2;
+    if (!self._encodeCanvases) {
+      self._encodeCanvases = [];
+      self._encodeCtxs = [];
+      for (var ei = 0; ei < ENCODE_SLOTS; ei++) {
+        var ec = document.createElement("canvas");
+        self._encodeCanvases.push(ec);
+        self._encodeCtxs.push(ec.getContext("2d", { alpha: false, desynchronized: true }));
+      }
+      self._encodeSlot = 0;
+      self._encodeInFlight = 0;
+    }
+
+    function sizeEncodeCanvas(canvas, ctx, srcW, srcH) {
+      var w = srcW, h = srcH;
+      if (w > MAX_DISPLAY_W) {
+        h = Math.round(h * (MAX_DISPLAY_W / w));
+        w = MAX_DISPLAY_W;
+      }
+      if (w & 1) w--;
+      if (h & 1) h--;
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w; canvas.height = h;
+      }
+      self._displayW = w; self._displayH = h;
+      if (scratch.width !== w || scratch.height !== h) {
+        scratch.width = w; scratch.height = h;
+      }
+      return { w: w, h: h, ctx: ctx, canvas: canvas };
+    }
+
+    function kickEncode() {
+      while (self._encodeInFlight < ENCODE_SLOTS && self._encodePending.length && !self._aborted(gen)) {
+        var item = self._encodePending.shift();
+        var frame = item.frame;
+        var ts = item.ts;
+        var slot = self._encodeSlot % ENCODE_SLOTS;
+        self._encodeSlot++;
+        var canvas = self._encodeCanvases[slot];
+        var ctx2 = self._encodeCtxs[slot];
+        var sized;
+        try {
+          sized = sizeEncodeCanvas(canvas, ctx2,
+            frame.displayWidth || frame.codedWidth || 640,
+            frame.displayHeight || frame.codedHeight || 360);
+          sized.ctx.drawImage(frame, 0, 0, sized.w, sized.h);
+        } catch (e) {
+          try { frame.close(); } catch (_) {}
+          self.diag.framesDropped++;
+          continue;
+        }
+        try { frame.close(); } catch (_) {}
+
+        self._encodeInFlight++;
+        self._encodeBusy = self._encodeInFlight > 0;
+        (function (c, frameTs) {
+          function finish(url) {
+            self._encodeInFlight = Math.max(0, self._encodeInFlight - 1);
+            self._encodeBusy = self._encodeInFlight > 0;
+            if (self._aborted(gen)) {
+              if (url && String(url).indexOf("blob:") === 0) {
+                try { URL.revokeObjectURL(url); } catch (_) {}
+              }
+              return;
+            }
+            if (url) {
+              // Keep ready queue ordered by PTS (slots can finish out of order)
+              var q = self._readyQueue, ii = q.length;
+              while (ii > 0 && q[ii - 1].ts > frameTs) ii--;
+              q.splice(ii, 0, { url: url, ts: frameTs });
+            } else {
+              self.diag.framesDropped++;
+            }
+            kickEncode();
+            try { kickDecode(); } catch (_) {}
+          }
+          try {
+            if (c.toBlob) {
+              c.toBlob(function (blob) {
+                if (!blob) { finish(null); return; }
+                finish(URL.createObjectURL(blob));
+              }, "image/jpeg", JPEG_Q);
+            } else {
+              finish(c.toDataURL("image/jpeg", JPEG_Q));
+            }
+          } catch (e) {
+            self.diag.framesDropped++;
+            self._encodeInFlight = Math.max(0, self._encodeInFlight - 1);
+            self._encodeBusy = self._encodeInFlight > 0;
+            kickEncode();
+          }
+        })(sized.canvas, ts);
+      }
+    }
+
+    function enqueueDecodedFrame(frame, adjTs) {
+      // Never drop the head of the ready queue (that causes jumps). Prefer
+      // pausing the demux/decode feed (MAX_ENCODE_AHEAD). Only discard a brand
+      // new decoded frame if the pipeline is truly overflowing.
+      if (readyDepth() >= MAX_READY) {
+        try { frame.close(); } catch (_) {}
+        self.diag.framesDropped++;
+        return;
+      }
+      self._encodePending.push({ frame: frame, ts: adjTs });
+      kickEncode();
+    }
+
     function configureVideo(info, mp4file) {
       if (videoConfigured || !info.videoTracks.length) return;
       videoTrackInfo = info.videoTracks[0];
       var codec = videoTrackInfo.codec || "avc1.42E01E";
       var w = videoTrackInfo.track_width || 640;
       var h = videoTrackInfo.track_height || 360;
-      scratch.width = w; scratch.height = h;
+      ensureEncodeCanvas(w, h);
       var description = getAvcDescription(mp4file, videoTrackInfo.id);
       self._videoDec = new VideoDecoder({
         output: function (frame) {
           if (self._aborted(gen)) { frame.close(); return; }
           self.diag.framesDecoded++;
-          // Remap PTS discontinuities (TS segment joins / PCR jumps) onto a
-          // continuous timeline so the audio-locked clock does not stall or
-          // skip. A jump >0.5s relative to the prior frame is treated as a
-          // discontinuity; smaller gaps (B-frame reorder) pass through.
+          // Remap PTS discontinuities onto a continuous timeline.
           var rawTs = frame.timestamp;
           if (self._lastRawPtsUs != null) {
             var delta = rawTs - self._lastRawPtsUs;
@@ -443,20 +615,7 @@
           }
           self._lastRawPtsUs = rawTs;
           var adjTs = rawTs + self._ptsOffsetUs;
-          try {
-            if (typeof frame.timestamp !== "undefined") {
-              // VideoFrame.timestamp is readonly; wrap via queue sidecar.
-            }
-          } catch (_) {}
-          if (self._frameQueue.length >= 45) {
-            try { frame.close(); } catch (_) {}
-            return;
-          }
-          // Store adjusted PTS on a sidecar; paint loop reads .__ts || .timestamp
-          frame.__ts = adjTs;
-          var q = self._frameQueue, ts = adjTs, ii = q.length;
-          while (ii > 0 && (q[ii - 1].__ts != null ? q[ii - 1].__ts : q[ii - 1].timestamp) > ts) ii--;
-          q.splice(ii, 0, frame);
+          enqueueDecodedFrame(frame, adjTs);
         },
         error: function (e) {
           decoderError = e;
@@ -517,17 +676,26 @@
       configureAudio(info, file);
       file.start();
     };
+    function kickDecode() {
+      if (!self._videoDec || self._videoDec.state !== "configured") return;
+      while (self._chunkQueue.length &&
+             readyDepth() < MAX_ENCODE_AHEAD &&
+             self._videoDec.decodeQueueSize < 8) {
+        var ch = self._chunkQueue.shift();
+        try { self._videoDec.decode(ch); }
+        catch (e) { self._emit("warn", "live_decode", { msg: e.message }); }
+      }
+    }
+
     file.onSamples = function (id, user, list) {
       var i, s, timescale;
       for (i = 0; i < list.length; i++) {
         s = list[i];
         if (user === "video" && self._videoDec && self._videoDec.state === "configured") {
-          if (self._frameQueue.length >= 40 || self._videoDec.decodeQueueSize > 20) {
-            continue; // backpressure — wait for the paint loop to drain
-          }
+          // Never drop encoded samples — queue and let kickDecode apply backpressure.
           timescale = videoTrackInfo.timescale || 1000;
           try {
-            self._videoDec.decode(new EncodedVideoChunk({
+            self._chunkQueue.push(new EncodedVideoChunk({
               type: s.is_sync ? "key" : "delta",
               timestamp: (s.cts * 1e6) / timescale,
               duration: (s.duration * 1e6) / timescale,
@@ -548,6 +716,7 @@
           } catch (_) {}
         }
       }
+      kickDecode();
     };
 
     if (audioPlUrl) {
@@ -662,6 +831,9 @@
       var cap = pl.endList ? 2 : candidates.length;
       for (i = 0; i < Math.min(candidates.length, cap); i++) {
         if (self._aborted(gen)) return added;
+        // Pause video ingest while the encode/display pipeline is full so we
+        // never have to drop encoded chunks (drops = visible jumps).
+        if (!isAudio && (self._chunkQueue.length + readyDepth()) > 90) break;
         var s = prepareSeg(candidates[i].raw, offRef);
         seen[candidates[i].key] = true;
         seen[segKey(s)] = true;
@@ -679,25 +851,35 @@
 
     // Wait briefly for first decoded frames
     var waitStart = performance.now();
-    while (!this._aborted(gen) && this._frameQueue.length < 1 && performance.now() - waitStart < 8000) {
+    while (!this._aborted(gen) && this._readyQueue.length < 1 && performance.now() - waitStart < 8000) {
       if (decoderError) throw decoderError;
       await this._wait(30);
     }
-    if (!this._frameQueue.length && !decoderError) {
+    if (!this._readyQueue.length && !decoderError) {
       // Keep pulling a bit more for VOD
       if (media.endList) {
         media = await loadPlaylist(videoPlUrl);
         await fetchNewSegments(media, seenV, offV, false);
         waitStart = performance.now();
-        while (!this._aborted(gen) && this._frameQueue.length < 1 && performance.now() - waitStart < 6000) {
+        while (!this._aborted(gen) && this._readyQueue.length < 1 && performance.now() - waitStart < 6000) {
           if (decoderError) throw decoderError;
           await this._wait(30);
         }
       }
     }
     if (decoderError) throw decoderError;
-    if (!this._frameQueue.length) {
+    if (!this._readyQueue.length) {
       throw new Error("no frames decoded (WebCodecs may be stalling, or stream has no video)");
+    }
+
+    // Preroll JPEGs so the display clock never starts against an empty encode
+    // pipeline (that made every early frame "late" and looked like stutter).
+    waitStart = performance.now();
+    while (!this._aborted(gen) && this._readyQueue.length < 10 &&
+           performance.now() - waitStart < 4000) {
+      if (decoderError) throw decoderError;
+      try { kickDecode(); } catch (_) {}
+      await this._wait(20);
     }
 
     this._setStage("playing");
@@ -716,9 +898,8 @@
         if (!this._nextAudioTime) {
           this._nextAudioTime = this._audioCtx.currentTime + 0.08;
           this._avStartCtx = this._nextAudioTime;
-          if (this._frameQueue.length && !this._videoOriginSet) {
-            var f0 = this._frameQueue[0];
-            this._videoOriginUs = f0.__ts != null ? f0.__ts : f0.timestamp;
+          if (this._readyQueue.length && !this._videoOriginSet) {
+            this._videoOriginUs = this._readyQueue[0].ts;
             this._videoOriginSet = true;
           }
           this._audioMediaStartUs = this._audioQueue[0].timestamp;
@@ -760,11 +941,10 @@
       if (!this._started) {
         var haveAudio = !!(this._audioCtx && this._audioStartCtx);
         var needAudio = !!this._audioDec;
-        if (this._frameQueue.length && (!needAudio || haveAudio)) {
+        if (this._readyQueue.length && (!needAudio || haveAudio)) {
           this._started = true;
           if (!this._videoOriginSet) {
-            var vf0 = this._frameQueue[0];
-            this._videoOriginUs = vf0.__ts != null ? vf0.__ts : vf0.timestamp;
+            this._videoOriginUs = this._readyQueue[0].ts;
             this._videoOriginSet = true;
           }
           this._mediaStartUs = this._videoOriginUs;
@@ -779,10 +959,10 @@
         }
       }
 
-      // Picture at real-time 1x, locked to AudioContext when audio is playing.
-      // Late frames are dropped; future frames wait. Snap ONLY on a true PTS
-      // discontinuity (queue head >> clock). Chasing the decode frontier caused
-      // the timelapse.
+      // Picture at 1x locked to AudioContext. Ready JPEGs are presented IN
+      // ORDER. Never drop a ready frame to catch up — if late, show it as soon
+      // as the <img> is free and hold the previous frame until then. Decode /
+      // JPEG prep runs ahead into _readyQueue (backpressured, not head-dropped).
       var nowVideoUs;
       var elapsedUs;
       if (this._audioCtx && this._avStartCtx) {
@@ -793,43 +973,50 @@
         nowVideoUs = this._videoOriginUs + elapsedUs;
       }
 
-      function frameTs(f) { return f.__ts != null ? f.__ts : f.timestamp; }
-
-      // Safety net if remap missed a jump (should be rare).
-      if (this._frameQueue.length) {
-        var headTs = frameTs(this._frameQueue[0]);
-        if (headTs > nowVideoUs + 750000) {
-          this._videoOriginUs = headTs - elapsedUs;
-          nowVideoUs = headTs;
+      // Soft realign only if remap left a multi-second hole at the head.
+      if (this._readyQueue.length) {
+        var headTs0 = this._readyQueue[0].ts;
+        if (headTs0 > nowVideoUs + 1500000) {
+          this._videoOriginUs = headTs0 - elapsedUs;
+          nowVideoUs = headTs0;
         }
       }
 
-      while (this._frameQueue.length > 1 && frameTs(this._frameQueue[1]) <= nowVideoUs) {
-        try { this._frameQueue.shift().close(); } catch (_) {} // drop late
-      }
-      if (this._frameQueue.length && frameTs(this._frameQueue[0]) <= nowVideoUs + 40000) {
-        var fr = this._frameQueue.shift();
-        try {
-          this.diag.driftMs = Math.round((frameTs(fr) - nowVideoUs) / 1000);
-          scratchCtx.drawImage(fr, 0, 0, scratch.width, scratch.height);
-          fr.close();
-          this.diag.framesDrawn++;
-          if (pushFrame) {
-            try { var p = pushFrame(gen); if (p && p.then) p.catch(function () {}); } catch (_) {}
-          }
-        } catch (e) {
-          try { fr.close(); } catch (_) {}
-          this._emit("warn", "live_paint", { msg: e && e.message || String(e) });
+      var presentFrame = this.opts.presentFrame || null;
+      // Present due/late frames IN ORDER. Never drop the head to catch up.
+      // If several frames are already late, drain a few per tick (still in
+      // order) so the picture briefly freezes less and returns to the audio
+      // clock without skipping. Future frames wait (hold previous).
+      var drained = 0;
+      while (this._readyQueue.length && drained < 4) {
+        var head = this._readyQueue[0];
+        if (head.ts > nowVideoUs + 25000) break; // still in the future — hold
+        var presented = true;
+        if (presentFrame) {
+          try { presented = !!presentFrame(head.url); } catch (_) { presented = false; }
         }
+        if (!presented) break; // rare: hold head, retry (never skip)
+        this._readyQueue.shift();
+        this.diag.framesShown++;
+        this.diag.framesDrawn = this.diag.framesShown;
+        this.diag.driftMs = Math.round((head.ts - nowVideoUs) / 1000);
+        if (nowVideoUs > head.ts + 100000) this.diag.framesLate++;
+        drained++;
       }
 
-      var newest = this._frameQueue.length ? frameTs(this._frameQueue[this._frameQueue.length - 1]) : nowVideoUs;
+      var newest = this._readyQueue.length
+        ? this._readyQueue[this._readyQueue.length - 1].ts
+        : nowVideoUs;
       this.diag.bufferMs = Math.max(0, Math.round((newest - nowVideoUs) / 1000));
+      this.diag.readyQ = this._readyQueue.length;
       if (this.opts.onHud) {
         this.opts.onHud({
           time: Math.max(0, elapsedUs / 1e6),
-          framesDrawn: this.diag.framesDrawn,
+          framesDrawn: this.diag.framesShown,
           framesDecoded: this.diag.framesDecoded,
+          framesShown: this.diag.framesShown,
+          framesLate: this.diag.framesLate,
+          framesDropped: this.diag.framesDropped,
           bufferMs: this.diag.bufferMs,
           driftMs: this.diag.driftMs
         });
@@ -839,25 +1026,36 @@
         this._countEls();
         if (this.opts.onDiag) this.opts.onDiag(this.diag);
         this._emit("info", "live_heartbeat", {
-          msg: "decoded=" + this.diag.framesDecoded + " drawn=" + this.diag.framesDrawn +
-            " segs=" + this.diag.segmentsFetched + " bufMs=" + this.diag.bufferMs +
-            " driftMs=" + this.diag.driftMs + " aBufMs=" + this.diag.audioBufferedMs,
+          msg: "decoded=" + this.diag.framesDecoded +
+            " shown=" + this.diag.framesShown +
+            " late=" + this.diag.framesLate +
+            " drop=" + this.diag.framesDropped +
+            " segs=" + this.diag.segmentsFetched +
+            " bufMs=" + this.diag.bufferMs +
+            " driftMs=" + this.diag.driftMs +
+            " readyQ=" + this.diag.readyQ +
+            " chunkQ=" + (this._chunkQueue ? this._chunkQueue.length : 0),
           streamId: stream.id,
           framesDecoded: this.diag.framesDecoded,
-          framesDrawn: this.diag.framesDrawn,
+          framesShown: this.diag.framesShown,
+          framesLate: this.diag.framesLate,
+          framesDropped: this.diag.framesDropped,
           bufferMs: this.diag.bufferMs,
           driftMs: this.diag.driftMs,
           audioBufferedMs: this.diag.audioBufferedMs
         });
       }
 
-      if (vodDone && this._frameQueue.length === 0 &&
+      if (vodDone && this._readyQueue.length === 0 && this._encodePending.length === 0 &&
+          this._chunkQueue.length === 0 &&
           this._audioQueue.length === 0 &&
           (!this._nextAudioTime || !this._audioCtx ||
             this._nextAudioTime <= this._audioCtx.currentTime + 0.05)) {
         this._setStage("ended");
         break;
       }
+
+      try { kickDecode(); } catch (_) {}
 
       // Network pull AFTER A/V so a slow transmux cannot stall audio/picture.
       if (performance.now() - lastPull > (media.endList ? 500 : Math.max(1000, media.targetDuration * 400))) {
@@ -870,7 +1068,9 @@
               audioPl = await loadPlaylist(audioPlUrl);
               await fetchNewSegments(audioPl, seenA, offA, true);
             }
-            if (media.endList && n === 0 && self._frameQueue.length === 0 &&
+            if (media.endList && n === 0 && self._readyQueue.length === 0 &&
+                self._encodePending.length === 0 &&
+                self._chunkQueue.length === 0 &&
                 (!self._videoDec || self._videoDec.decodeQueueSize === 0)) {
               vodDone = true;
             }

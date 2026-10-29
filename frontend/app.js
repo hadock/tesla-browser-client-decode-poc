@@ -1399,44 +1399,34 @@
     }
   }
 
+  // Present is non-blocking: always accept the next JPEG URL. Waiting on
+  // <img>.load gated the display to ~11–14 fps and forced the ready queue to
+  // overflow (then drop). The browser paints src updates; we revoke the prior
+  // blob after a short delay. Never skip the head in the player — only hold
+  // when a frame is still in the future relative to the audio clock.
   function liveSetImg(url) {
-    if (liveImgBusy) return false;
-    liveImgBusy = true;
+    if (!url) return false;
     if (livePrevUrl) liveRmUrl(livePrevUrl);
     livePrevUrl = liveObjectUrl;
     liveObjectUrl = url;
     liveFrameEl.src = url;
+    liveImgBusy = false;
     return true;
   }
 
   if (liveFrameEl) {
-    liveFrameEl.decoding = "sync";
+    liveFrameEl.decoding = "async";
     liveFrameEl.addEventListener("load", function () {
-      liveImgBusy = false;
       if (liveFrameEl.src) liveStageEl.classList.remove("idle");
       if (livePrevUrl) { liveRmUrl(livePrevUrl); livePrevUrl = null; }
     });
     liveFrameEl.addEventListener("error", function () {
-      liveImgBusy = false;
       if (livePrevUrl) { liveRmUrl(livePrevUrl); livePrevUrl = null; }
     });
   }
 
-  async function livePushFrame(gen) {
-    if (liveBlobBusy || liveImgBusy) return false;
-    liveBlobBusy = true;
-    return new Promise(function (resolve) {
-      if (liveScratch.toBlob) {
-        liveScratch.toBlob(function (blob) {
-          liveBlobBusy = false;
-          if (!blob) { resolve(false); return; }
-          resolve(liveSetImg(URL.createObjectURL(blob)));
-        }, "image/jpeg", 0.7);
-      } else {
-        liveBlobBusy = false;
-        resolve(liveSetImg(liveScratch.toDataURL("image/jpeg", 0.7)));
-      }
-    });
+  function livePresentFrame(url) {
+    return liveSetImg(url);
   }
 
   function renderLiveDiag(d) {
@@ -1452,7 +1442,10 @@
       ["Format", d.format || "—", ""],
       ["Segments", String(d.segmentsFetched || 0), ""],
       ["Decoded", String(d.framesDecoded || 0), ""],
-      ["Drawn", String(d.framesDrawn || 0), ""],
+      ["Shown", String(d.framesShown != null ? d.framesShown : (d.framesDrawn || 0)), ""],
+      ["Late", String(d.framesLate || 0), (d.framesLate || 0) > 30 ? "warn" : "ok"],
+      ["Dropped", String(d.framesDropped || 0), (d.framesDropped || 0) > 0 ? "warn" : "ok"],
+      ["Ready Q", String(d.readyQ || 0), ""],
       ["Audio chunks", String(d.audioChunks || 0), ""],
       ["Audio buffered", (d.audioBufferedMs != null ? d.audioBufferedMs + " ms" : "—"), ""],
       ["Buffer", (d.bufferMs != null ? d.bufferMs + " ms" : "—"), ""],
@@ -1538,7 +1531,7 @@
     livePlayer = new LiveHls.LivePlayer({
       scratch: liveScratch,
       scratchCtx: liveScratchCtx,
-      pushFrame: livePushFrame,
+      presentFrame: livePresentFrame,
       ensureAudioCtx: ensureAudioCtx,
       onLog: function (level, event, fields) {
         cwLog(level, event, Object.assign({ clip: stream.id }, fields || {}));
@@ -1601,6 +1594,7 @@
       muxjs: typeof muxjs !== "undefined",
       mp4box: typeof MP4Box !== "undefined",
       stage: "idle", segmentsFetched: 0, framesDecoded: 0, framesDrawn: 0,
+      framesShown: 0, framesLate: 0, framesDropped: 0, readyQ: 0,
       audioChunks: 0, bufferMs: 0, driftMs: 0, audioBufferedMs: 0,
       videoEls: 0, audioEls: 0, error: null
     });

@@ -12,6 +12,12 @@
     <p class="tagline">Drive-safe: JPEG &lt;img&gt; + Web Audio · no &lt;video&gt; unless ?allowVideo=1</p>
   </header>
 
+  <nav class="tabs" role="tablist" aria-label="Player mode">
+    <button type="button" class="tab active" role="tab" id="tabClips" aria-selected="true" aria-controls="panelClips">Clips</button>
+    <button type="button" class="tab" role="tab" id="tabLive" aria-selected="false" aria-controls="panelLive">Live Streaming</button>
+  </nav>
+
+  <div id="panelClips" class="tab-panel" role="tabpanel" aria-labelledby="tabClips">
   <main class="watch">
     <div class="primary">
       <section class="stage idle" id="stage" role="button" tabindex="0" aria-label="Play / pause">
@@ -53,6 +59,50 @@
       <div id="clipList" class="clip-list" role="list"></div>
     </aside>
   </main>
+  </div>
+
+  <div id="panelLive" class="tab-panel" role="tabpanel" aria-labelledby="tabLive" hidden>
+  <main class="watch">
+    <div class="primary">
+      <section class="stage idle" id="liveStage" role="button" tabindex="0" aria-label="Play / pause live">
+        <img id="liveFrame" alt="Live decoded frame" width="1280" height="720" />
+        <canvas id="liveScratch" width="1280" height="720" hidden></canvas>
+        <div class="overlay" id="liveOverlay"><span class="overlay-btn" id="liveOverlayIcon">▶</span></div>
+        <div class="stage-status" id="liveStageStatus" hidden></div>
+      </section>
+
+      <section class="np">
+        <div class="np-head">
+          <div>
+            <h2 id="liveTitle">Live Streaming</h2>
+            <div class="np-artist"><span id="liveSubtitle">Fixed public test feeds · HLS → WebCodecs → canvas → JPEG &lt;img&gt;</span></div>
+          </div>
+        </div>
+        <div class="controls">
+          <button type="button" id="btnLiveStop" disabled>■ Stop</button>
+          <span id="liveStatus" class="status">Tap a test stream</span>
+        </div>
+        <div class="live-banner" id="liveWcBanner" hidden>
+          <strong>WebCodecs unavailable.</strong>
+          Live HLS needs <code>VideoDecoder</code>. That path previously stalled in the Tesla in-car browser — use this tab to capture where it fails (see Live diagnostics below). The Clips tab (JPEG packs) is the path that works in the car.
+        </div>
+        <div class="attribution" id="liveAttr">
+          <strong>About these feeds</strong>
+          <span>Hard-coded public test streams only (no channel directory, no user M3U, no proxy). Media stays on the third-party CDN — nothing is rehosted here. Same PoC disclaimer: testing only, not while driving.</span>
+        </div>
+      </section>
+    </div>
+
+    <aside class="sidebar">
+      <h2 class="sidebar-h">Test streams <span class="muted">· 3 fixed</span></h2>
+      <div id="liveList" class="clip-list" role="list"></div>
+      <section class="live-diag" id="liveDiag">
+        <h3>Live diagnostics</h3>
+        <div class="live-diag-grid" id="liveDiagGrid"></div>
+      </section>
+    </aside>
+  </main>
+  </div>
 
   <details class="debug" id="debugPanel">
     <summary>Debug</summary>
@@ -89,16 +139,18 @@
       <label class="url-label">Paste a video URL (debug)
         <input id="urlInput" type="url" placeholder="https://example.com/clip.mp4 (needs CORS)" />
       </label>
-      <p class="hint">Packs are JPEG+PCM, zero &lt;video&gt;. WebCodecs may probe green but hang on Tesla Chromium. Flags: <code>?pack=1</code> (autostart) <code>?wc=1</code> <code>?allowVideo=1</code>. Optional remote debug logs → <code>/api/logs</code> (deploy with <code>ENABLE_LOGS=1</code>); <code>?logs=0</code> turns them off for one visit.</p>
+      <p class="hint">Packs are JPEG+PCM, zero &lt;video&gt;. WebCodecs may probe green but hang on Tesla Chromium. Flags: <code>?pack=1</code> (autostart) <code>?wc=1</code> <code>?allowVideo=1</code> <code>?tab=live</code>. Optional remote debug logs → <code>/api/logs</code> (deploy with <code>ENABLE_LOGS=1</code>); <code>?logs=0</code> turns them off for one visit.</p>
     </section>
   </details>
 
   <footer>
-    <p class="disclaimer"><strong>Disclaimer:</strong> proof of concept for security research and testing only. Not for use while driving — test parked, or with a passenger filming. Provided as-is, with no warranty. Responsibility for any use lies entirely with the person who deploys or uses it. Code: MIT license. Media clips: CC BY 3.0 (see attribution above).</p>
+    <p class="disclaimer"><strong>Disclaimer:</strong> proof of concept for security research and testing only. Not for use while driving — test parked, or with a passenger filming. Provided as-is, with no warranty. Responsibility for any use lies entirely with the person who deploys or uses it. Code: MIT license. Media clips: CC BY 3.0 (see attribution above). Live test feeds remain on their third-party CDNs and are not rehosted.</p>
   </footer>
 
   <script src="vendor/mp4box.all.min.js"></script>
+  <script src="vendor/mux.min.js"></script>
   <script src="config.js"></script>
+  <script src="live.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

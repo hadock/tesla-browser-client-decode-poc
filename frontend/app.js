@@ -1357,11 +1357,276 @@
     refreshVideoElHud();
     flushLogs();
 
+    initLiveTab();
+
     // Auto-start pack playlist if ?pack=1
     if (FORCE_PACK && catalog.clips.length) {
       setTimeout(function () { startFromIndex(0, { forcePack: true }); }, 300);
     }
   }
+
+
+  /* ---------- Live Streaming tab (fixed 3 public HLS test feeds) ---------- */
+  var livePlayer = null;
+  var liveObjectUrl = null;
+  var livePrevUrl = null;
+  var liveImgBusy = false;
+  var liveBlobBusy = false;
+  var liveActive = false;
+  var liveSelectedId = null;
+
+  var liveFrameEl = $("liveFrame");
+  var liveScratch = $("liveScratch");
+  var liveScratchCtx = liveScratch ? liveScratch.getContext("2d", { willReadFrequently: true }) : null;
+  var liveStageEl = $("liveStage");
+  var liveStageStatus = $("liveStageStatus");
+  var liveOverlayIcon = $("liveOverlayIcon");
+  var liveStatusEl = $("liveStatus");
+  var liveTitleEl = $("liveTitle");
+  var liveSubtitleEl = $("liveSubtitle");
+  var liveList = $("liveList");
+  var liveDiagGrid = $("liveDiagGrid");
+  var btnLiveStop = $("btnLiveStop");
+  var liveWcBanner = $("liveWcBanner");
+  var tabClips = $("tabClips");
+  var tabLive = $("tabLive");
+  var panelClips = $("panelClips");
+  var panelLive = $("panelLive");
+
+  function liveRmUrl(u) {
+    if (u && String(u).indexOf("blob:") === 0) {
+      try { URL.revokeObjectURL(u); } catch (_) {}
+    }
+  }
+
+  function liveSetImg(url) {
+    if (liveImgBusy) return false;
+    liveImgBusy = true;
+    if (livePrevUrl) liveRmUrl(livePrevUrl);
+    livePrevUrl = liveObjectUrl;
+    liveObjectUrl = url;
+    liveFrameEl.src = url;
+    return true;
+  }
+
+  if (liveFrameEl) {
+    liveFrameEl.decoding = "sync";
+    liveFrameEl.addEventListener("load", function () {
+      liveImgBusy = false;
+      if (liveFrameEl.src) liveStageEl.classList.remove("idle");
+      if (livePrevUrl) { liveRmUrl(livePrevUrl); livePrevUrl = null; }
+    });
+    liveFrameEl.addEventListener("error", function () {
+      liveImgBusy = false;
+      if (livePrevUrl) { liveRmUrl(livePrevUrl); livePrevUrl = null; }
+    });
+  }
+
+  async function livePushFrame(gen) {
+    if (liveBlobBusy || liveImgBusy) return false;
+    liveBlobBusy = true;
+    return new Promise(function (resolve) {
+      if (liveScratch.toBlob) {
+        liveScratch.toBlob(function (blob) {
+          liveBlobBusy = false;
+          if (!blob) { resolve(false); return; }
+          resolve(liveSetImg(URL.createObjectURL(blob)));
+        }, "image/jpeg", 0.7);
+      } else {
+        liveBlobBusy = false;
+        resolve(liveSetImg(liveScratch.toDataURL("image/jpeg", 0.7)));
+      }
+    });
+  }
+
+  function renderLiveDiag(d) {
+    if (!liveDiagGrid || !d) return;
+    var rows = [
+      ["WebCodecs", d.webCodecs ? "yes" : "NO — live path blocked", d.webCodecs ? "ok" : "bad"],
+      ["AudioDecoder", d.audioDecoder ? "yes" : "no", d.audioDecoder ? "ok" : "warn"],
+      ["mux.js", d.muxjs ? "yes" : "no", d.muxjs ? "ok" : "bad"],
+      ["MP4Box", d.mp4box ? "yes" : "no", d.mp4box ? "ok" : "bad"],
+      ["Stage", d.stage || "—", ""],
+      ["Stream", d.streamId || "—", ""],
+      ["Variant", d.variant || "—", ""],
+      ["Format", d.format || "—", ""],
+      ["Segments", String(d.segmentsFetched || 0), ""],
+      ["Decoded", String(d.framesDecoded || 0), ""],
+      ["Drawn", String(d.framesDrawn || 0), ""],
+      ["Audio chunks", String(d.audioChunks || 0), ""],
+      ["Buffer", (d.bufferMs != null ? d.bufferMs + " ms" : "—"), ""],
+      ["<video> els", String(d.videoEls || 0), d.videoEls ? "bad" : "ok"],
+      ["<audio> els", String(d.audioEls || 0), d.audioEls ? "bad" : "ok"],
+      ["Error", d.error || "—", d.error ? "bad" : "ok"]
+    ];
+    liveDiagGrid.textContent = "";
+    rows.forEach(function (row) {
+      var div = document.createElement("div");
+      var k = document.createElement("span"); k.className = "k"; k.textContent = row[0];
+      var v = document.createElement("span");
+      if (row[2]) v.className = row[2];
+      v.textContent = row[1];
+      div.appendChild(k); div.appendChild(v);
+      liveDiagGrid.appendChild(div);
+    });
+  }
+
+  function updateLiveStageUi(playingLive, paused) {
+    if (!liveStageEl) return;
+    liveStageEl.classList.toggle("playing", !!playingLive);
+    liveStageEl.classList.toggle("paused", !!paused);
+    if (liveOverlayIcon) liveOverlayIcon.textContent = playingLive && !paused ? "❚❚" : "▶";
+  }
+
+  function stopLive() {
+    if (livePlayer) livePlayer.stop();
+    liveActive = false;
+    if (btnLiveStop) btnLiveStop.disabled = true;
+    updateLiveStageUi(false, false);
+    if (liveStatusEl) liveStatusEl.textContent = "Stopped";
+    [].forEach.call(liveList.querySelectorAll(".clip"), function (b) { b.classList.remove("playing"); });
+  }
+
+  function switchTab(which) {
+    var toLive = which === "live";
+    if (toLive) {
+      // Stop clip playback when entering live
+      if (playing) stopPlayback();
+      panelClips.hidden = true;
+      panelLive.hidden = false;
+      tabClips.classList.remove("active"); tabClips.setAttribute("aria-selected", "false");
+      tabLive.classList.add("active"); tabLive.setAttribute("aria-selected", "true");
+      try { history.replaceState(null, "", (location.pathname + location.search).replace(/([?&])tab=live&?/, "$1").replace(/[?&]$/, "") + (location.search ? (location.search.indexOf("tab=") >= 0 ? "" : "&tab=live") : "?tab=live")); } catch (_) {}
+    } else {
+      stopLive();
+      panelLive.hidden = true;
+      panelClips.hidden = false;
+      tabLive.classList.remove("active"); tabLive.setAttribute("aria-selected", "false");
+      tabClips.classList.add("active"); tabClips.setAttribute("aria-selected", "true");
+    }
+  }
+
+  async function startLiveStream(stream) {
+    if (!window.LiveHls || !LiveHls.LivePlayer) {
+      if (liveStatusEl) liveStatusEl.textContent = "live.js failed to load";
+      return;
+    }
+    unlockAudio();
+    if (playing) stopPlayback();
+    stopLive();
+    liveSelectedId = stream.id;
+    liveActive = true;
+    liveImgBusy = false;
+    liveBlobBusy = false;
+    liveStageEl.classList.add("idle");
+    if (liveTitleEl) liveTitleEl.textContent = stream.title;
+    if (liveSubtitleEl) liveSubtitleEl.textContent = stream.subtitle + " · " + stream.note;
+    if (liveStatusEl) liveStatusEl.textContent = "Starting…";
+    if (btnLiveStop) btnLiveStop.disabled = false;
+    [].forEach.call(liveList.querySelectorAll(".clip"), function (b) {
+      b.classList.toggle("playing", b.dataset.id === stream.id);
+      b.classList.toggle("selected", b.dataset.id === stream.id);
+    });
+    setPath("Live HLS → WebCodecs", true);
+    hud.renderer.textContent = "Live HLS → WebCodecs → canvas → JPEG <img>";
+    hud.renderer.style.color = "var(--ok)";
+    refreshVideoElHud();
+    cwLog("info", "live_start", { msg: "start " + stream.id, streamId: stream.id, clip: stream.id });
+
+    livePlayer = new LiveHls.LivePlayer({
+      scratch: liveScratch,
+      scratchCtx: liveScratchCtx,
+      pushFrame: livePushFrame,
+      ensureAudioCtx: ensureAudioCtx,
+      onLog: function (level, event, fields) {
+        cwLog(level, event, Object.assign({ clip: stream.id }, fields || {}));
+      },
+      onDiag: function (d) { renderLiveDiag(d); refreshVideoElHud(); },
+      onStage: function (stage) {
+        if (liveStatusEl) liveStatusEl.textContent = stage;
+        if (liveStageStatus) {
+          var show = stage && stage !== "playing";
+          liveStageStatus.hidden = !show;
+          if (show) liveStageStatus.textContent = stage;
+        }
+        updateLiveStageUi(liveActive && stage !== "stopped" && stage !== "ended" && stage !== "error", false);
+      },
+      onHud: function (h) {
+        hud.time.textContent = (h.time || 0).toFixed(1) + "s";
+        hud.frames.textContent = String(h.framesDrawn || 0);
+        hud.fps.textContent = "buf " + (h.bufferMs || 0) + "ms";
+        frameCount = h.framesDrawn || 0;
+      }
+    });
+    renderLiveDiag(livePlayer.diag);
+    try {
+      await livePlayer.play(stream);
+    } catch (e) {
+      liveActive = false;
+      if (liveStatusEl) liveStatusEl.textContent = "Error: " + (e && e.message || e);
+      updateLiveStageUi(false, false);
+    }
+  }
+
+  function initLiveTab() {
+    if (!liveList || !window.LiveHls) {
+      cwLog("warn", "error", { msg: "LiveHls not available" });
+      return;
+    }
+    var wcOk = !!(typeof VideoDecoder !== "undefined" && typeof VideoFrame !== "undefined");
+    if (liveWcBanner) liveWcBanner.hidden = wcOk;
+    LiveHls.STREAMS.forEach(function (s) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "clip live";
+      btn.dataset.id = s.id;
+      btn.setAttribute("role", "listitem");
+      var thumb = document.createElement("div"); thumb.className = "thumb";
+      var badge = document.createElement("span"); badge.textContent = "LIVE";
+      thumb.appendChild(badge);
+      var txt = document.createElement("div");
+      var t = document.createElement("div"); t.className = "title"; t.textContent = s.title;
+      var a = document.createElement("div"); a.className = "artist"; a.textContent = s.subtitle;
+      var m = document.createElement("div"); m.className = "meta"; m.textContent = s.note;
+      txt.appendChild(t); txt.appendChild(a); txt.appendChild(m);
+      btn.appendChild(thumb); btn.appendChild(txt);
+      btn.addEventListener("click", function () { startLiveStream(s); });
+      liveList.appendChild(btn);
+    });
+    renderLiveDiag({
+      webCodecs: wcOk,
+      audioDecoder: typeof AudioDecoder !== "undefined",
+      muxjs: typeof muxjs !== "undefined",
+      mp4box: typeof MP4Box !== "undefined",
+      stage: "idle", segmentsFetched: 0, framesDecoded: 0, framesDrawn: 0,
+      audioChunks: 0, bufferMs: 0, videoEls: 0, audioEls: 0, error: null
+    });
+    if (btnLiveStop) btnLiveStop.addEventListener("click", function () { stopLive(); });
+    if (liveStageEl) {
+      liveStageEl.addEventListener("click", function () {
+        if (!liveActive || !livePlayer) {
+          var first = LiveHls.STREAMS[0];
+          if (first) startLiveStream(first);
+          return;
+        }
+        // pause/resume via AudioContext suspend
+        if (!audioCtx) return;
+        if (audioCtx.state === "running") {
+          audioCtx.suspend();
+          updateLiveStageUi(true, true);
+          if (liveStatusEl) liveStatusEl.textContent = "Paused — tap to resume";
+        } else {
+          audioCtx.resume();
+          updateLiveStageUi(true, false);
+          if (liveStatusEl) liveStatusEl.textContent = "playing";
+        }
+      });
+    }
+    if (tabClips) tabClips.addEventListener("click", function () { switchTab("clips"); });
+    if (tabLive) tabLive.addEventListener("click", function () { switchTab("live"); });
+    if (params.get("tab") === "live") switchTab("live");
+  }
+
 
   boot().catch(function (e) {
     setStage("Boot error: " + e.message);

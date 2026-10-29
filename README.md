@@ -58,6 +58,36 @@ Browser (Tesla in-car / desktop)
   All fetching, decoding, timing and rendering happen here, in the browser.
 ```
 
+## Live Streaming tab
+
+A second tab, **Live Streaming**, extends the same finding to **live HLS**:
+fetch a master/media playlist, demux segments client-side (MPEG-TS via
+vendored [mux.js](https://github.com/videojs/mux.js), or fMP4 via MP4Box),
+decode with WebCodecs, draw to a canvas, JPEG into an `<img>`, and play audio
+through Web Audio — still **zero** `<video>` / `<audio>` elements.
+
+The list is **fixed** to three public test feeds (no channel directory, no
+user-supplied M3U/URL, no proxy). Media stays on the third-party CDN; nothing
+is rehosted:
+
+| Stream | URL |
+|--------|-----|
+| NASA TV (public domain) | `https://ntv1.akamaized.net/hls/live/2014075/NASA-NTV1-HLS/master.m3u8` |
+| Akamai live test | `https://cph-p2p-msl.akamaized.net/hls/live/2000341/test/master.m3u8` |
+| Apple HLS example (fMP4) | `https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8` |
+
+Open with `?tab=live`. On-screen **Live diagnostics** show WebCodecs support,
+frames decoded/drawn, buffer, and errors. Live HLS **requires WebCodecs**;
+that path previously stalled in the Tesla browser — the banner and diagnostics
+are there to capture exactly where it fails in the car. The Clips tab (JPEG
+packs) remains the path that works in Drive mode. Remote logging of these
+diagnostics uses the same optional `/api/logs` path (`ENABLE_LOGS=1` only).
+
+Same safety disclaimer as the rest of the PoC: testing only, vehicle parked
+or a passenger filming — never while driving. Upstream feeds can go away or
+return empty media playlists; the player surfaces that as an error rather than
+falling back to a proxy.
+
 ## Hosted clips (CC BY 3.0 — not MIT)
 
 | Slug | Artist — Title | Segment |
@@ -218,7 +248,7 @@ scripts/deploy-cloudflare.sh Cloudflare target (build dist + generate wrangler c
 cloudflare/                  Worker (src/worker.js) + wrangler.template.jsonc
 infra/template.yaml          CloudFormation: S3 + CloudFront OAC; HTTP API + Lambda + log group only if EnableLogs=true
 backend/logs/handler.py      optional log Lambda: POST /api/logs → CloudWatch Logs (debug logs only, no media)
-frontend/                    SPA (index.html, app.js, styles.css, catalog.json, vendor/mp4box)
+frontend/                    SPA (index.html, app.js, live.js, styles.css, catalog.json, vendor/mp4box+mux.js)
 tools/                       build_packs.py (mp4 → frame pack), build_chunks.py (re-chunk), gen_wrangler.py
 media/, packs/               local source clips and frame packs (gitignored)
 ```
@@ -227,7 +257,7 @@ media/, packs/               local source clips and frame packs (gitignored)
 
 Code: [MIT](LICENSE), Copyright (c) 2026 Sergio Barraza. The media clips and
 derived packs are **not** MIT — they remain under their CC BY 3.0 licenses
-(see above). `frontend/vendor/mp4box.all.min.js` is MP4Box.js (BSD-3-Clause).
+(see above). `frontend/vendor/mp4box.all.min.js` is MP4Box.js (BSD-3-Clause); `frontend/vendor/mux.min.js` is mux.js (Apache-2.0).
 
 ## Security / disclosure
 

@@ -85,6 +85,21 @@ Extend the Drive-mode media policy to cover:
 or gate the combination behind the same Park/Drive check that already
 disables `<video>`.
 
+## Live Streaming extension
+
+The PoC's **Live Streaming** tab shows the same Drive-mode gap applies to
+**live HLS**, not only pre-packaged clips: the page demuxes HLS segments in
+the browser (MPEG-TS or fMP4), decodes with WebCodecs, and renders through
+canvas → JPEG `<img>` plus Web Audio, with no `<video>` element. The tab
+ships a **fixed** list of three public third-party test feeds (NASA TV,
+Akamai's live test stream, Apple's fMP4 HLS example). Those feeds are not
+rehosted; there is no channel directory, user-supplied playlist loader, or
+proxy. Live playback needs WebCodecs (which has stalled in the Tesla browser
+before); on-screen diagnostics record support, decode/draw counts, buffer
+and errors for a car-side screenshot. The JPEG-pack Clips tab remains the
+reliable in-car path. The same testing-only / not-while-driving disclaimer
+applies.
+
 ## Out of scope / non-goals
 
 - No attempt to bypass authentication, DRM, or network controls.

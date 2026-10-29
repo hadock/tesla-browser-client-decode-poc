@@ -147,8 +147,10 @@
     return stereo[0] || group.filter(function (m) { return m.defaultYes; })[0] || group[0];
   }
 
+  // One AbortController per play(); stop()/switch aborts in-flight fetches.
+  var activeSignal = null;
   async function fetchText(url) {
-    var r = await fetch(url, { credentials: "omit", mode: "cors" });
+    var r = await fetch(url, { credentials: "omit", mode: "cors", signal: activeSignal || undefined });
     if (!r.ok) throw new Error("HTTP " + r.status + " " + url.replace(/^https?:\/\//, "").split("/").slice(0, 3).join("/").slice(0, 80));
     return { text: await r.text(), url: r.url || url };
   }
@@ -159,7 +161,7 @@
       var start = byterange.offset != null ? byterange.offset : 0;
       headers.Range = "bytes=" + start + "-" + (start + byterange.length - 1);
     }
-    var r = await fetch(url, { headers: headers, credentials: "omit", mode: "cors" });
+    var r = await fetch(url, { headers: headers, credentials: "omit", mode: "cors", signal: activeSignal || undefined });
     if (!r.ok && r.status !== 206) throw new Error("segment HTTP " + r.status);
     return new Uint8Array(await r.arrayBuffer());
   }
@@ -177,6 +179,9 @@
     this._gen = 0;
     this._stop = false;
     this._timers = [];
+    this._audioSources = [];
+    this._audioGain = null;
+    this._abortCtl = null;
     this._videoDec = null;
     this._audioDec = null;
     this._frameQueue = [];
@@ -248,9 +253,36 @@
     if (this.opts.onDiag) this.opts.onDiag(this.diag);
   };
 
+  // Silence and drop every scheduled AudioBufferSource of this run NOW.
+  // Sources hang off a per-run GainNode: ramp it to 0 (no click), stop all
+  // sources, then disconnect the gain so nothing can reach the destination.
+  LivePlayer.prototype._killAudioGraph = function () {
+    var ctx = this._audioCtx, g = this._audioGain, srcs = this._audioSources;
+    this._audioGain = null;
+    this._audioSources = [];
+    if (!ctx) return;
+    var now = ctx.currentTime;
+    if (g) {
+      try { g.gain.cancelScheduledValues(now); g.gain.setValueAtTime(g.gain.value, now); g.gain.linearRampToValueAtTime(0, now + 0.012); } catch (_) {}
+    }
+    for (var i = 0; i < (srcs || []).length; i++) {
+      var sn = srcs[i];
+      try { sn.onended = null; sn.stop(now + 0.015); } catch (_) { try { sn.stop(); } catch (__) {} }
+    }
+    var disc = function () {
+      for (var j = 0; j < (srcs || []).length; j++) { try { srcs[j].disconnect(); } catch (_) {} }
+      if (g) { try { g.disconnect(); } catch (_) {} }
+    };
+    // Suspended ctx: ramps never run, so cut immediately.
+    if (ctx.state !== "running") disc(); else setTimeout(disc, 40);
+  };
+
   LivePlayer.prototype.stop = function () {
     this._stop = true;
     this._gen++;
+    if (this._abortCtl) { try { this._abortCtl.abort(); } catch (_) {} this._abortCtl = null; }
+    activeSignal = null;
+    this._killAudioGraph();
     var t;
     while ((t = this._timers.pop())) clearTimeout(t);
     this._closeDecoders();
@@ -272,6 +304,14 @@
     this._audioUnderrunStart = 0;
     this._lastAudioMediaTs = null;
     while (this._audioQueue.length) { try { this._audioQueue.shift().close(); } catch (_) {} }
+    this._nextAudioTime = 0;
+    this._avStartCtx = 0;
+    this._audioStartCtx = 0;
+    this._audioMediaStartUs = 0;
+    this._ptsOffsetUs = 0;
+    this._lastRawPtsUs = null;
+    this._videoOriginUs = 0;
+    this._videoOriginSet = false;
     this._started = false;
     this._setStage("stopped");
   };
@@ -296,7 +336,12 @@
   };
 
   LivePlayer.prototype.play = async function (stream) {
+    // Always tear the previous run down first (audio graph, fetches, decoders).
+    if (this._gen && !this._stop) this.stop();
+    else this._killAudioGraph();
     var gen = ++this._gen;
+    this._abortCtl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    activeSignal = this._abortCtl ? this._abortCtl.signal : null;
     this._stop = false;
     this._started = false;
     this._audioStartCtx = 0;
@@ -677,11 +722,11 @@
           if (self._aborted(gen)) return;
           self.diag.audioDecResets = (self.diag.audioDecResets || 0) + 1;
           if (self.diag.audioDecResets > 50) return;
-          setTimeout(function () {
+          self._timers.push(setTimeout(function () {
             if (self._aborted(gen)) return;
             try { self._audioDec = makeAudioDec(); kickAudioDecode(); }
             catch (e2) { self._emit("warn", "live_audio_cfg", { msg: e2.message }); }
-          }, 50);
+          }, 50));
         };
         aConfig = {
           codec: codec,
@@ -1018,7 +1063,19 @@
               }
               var src = this._audioCtx.createBufferSource();
               src.buffer = ab;
-              src.connect(this._audioCtx.destination);
+              if (!this._audioGain || this._audioGain.context !== this._audioCtx) {
+                this._audioGain = this._audioCtx.createGain();
+                this._audioGain.connect(this._audioCtx.destination);
+                this._audioSources = [];
+              }
+              src.connect(this._audioGain);
+              this._audioSources.push(src);
+              (function (list, node) {
+                node.onended = function () {
+                  var k = list.indexOf(node); if (k >= 0) list.splice(k, 1);
+                  try { node.disconnect(); } catch (_) {}
+                };
+              })(this._audioSources, src);
               // Never start in the past (WebKit drops/clips those).
               if (this._nextAudioTime < this._audioCtx.currentTime) this._nextAudioTime = this._audioCtx.currentTime + 0.01;
               src.start(this._nextAudioTime);

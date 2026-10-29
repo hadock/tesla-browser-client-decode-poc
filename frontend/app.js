@@ -1558,16 +1558,19 @@
     refreshVideoElHud();
     cwLog("info", "live_start", { msg: "start " + stream.id, streamId: stream.id, clip: stream.id });
 
-    livePlayer = new LiveHls.LivePlayer({
+    var thisPlayer = null;
+    livePlayer = thisPlayer = new LiveHls.LivePlayer({
       scratch: liveScratch,
       scratchCtx: liveScratchCtx,
-      presentFrame: livePresentFrame,
+      // A late frame from a torn-down player must never reach the <img>.
+      presentFrame: function (u) { return livePlayer === thisPlayer ? livePresentFrame(u) : false; },
       ensureAudioCtx: ensureAudioCtx,
       onLog: function (level, event, fields) {
         cwLog(level, event, Object.assign({ clip: stream.id }, fields || {}));
       },
-      onDiag: function (d) { renderLiveDiag(d); refreshVideoElHud(); },
+      onDiag: function (d) { if (livePlayer !== thisPlayer) return; renderLiveDiag(d); refreshVideoElHud(); },
       onStage: function (stage) {
+        if (livePlayer !== thisPlayer) return;
         if (liveStatusEl) liveStatusEl.textContent = stage;
         if (liveStageStatus) {
           var show = stage && stage !== "playing";
@@ -1577,6 +1580,7 @@
         updateLiveStageUi(liveActive && stage !== "stopped" && stage !== "ended" && stage !== "error", false);
       },
       onHud: function (h) {
+        if (livePlayer !== thisPlayer) return;
         hud.time.textContent = (h.time || 0).toFixed(1) + "s";
         hud.frames.textContent = String(h.framesDrawn || 0);
         hud.fps.textContent = "buf " + (h.bufferMs || 0) + "ms";

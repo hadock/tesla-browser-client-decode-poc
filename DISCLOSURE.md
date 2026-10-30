@@ -107,3 +107,14 @@ applies.
 - No persistence, no autofill of credentials, no phishing.
 - Source clips are CC BY 3.0 performance footage used solely to demonstrate
   lip/instrument sync; attribution is shown in the UI.
+
+## Debug telemetry (only when `ENABLE_LOGS` is on)
+
+When the deployment is built with `ENABLE_LOGS=1`, the page sends debug log batches to `/api/logs`, and they go to Workers Logs. To tell a Tesla in-car browser apart from a phone or desktop, each page load also sends one `client_info` event with:
+- `navigator.userAgent`, `platform`, `vendor`
+- `userAgentData` (brands, mobile, platform)
+- `deviceMemory`, `hardwareConcurrency`
+- screen size, viewport size and touch points
+- WebCodecs support
+
+The Worker adds the request's `User-Agent` header, the `Sec-CH-UA*` client hints, the country code (`CF-IPCountry`) and a short SHA-256 hash of the UA, which is used to count distinct UAs per day. **No IP address is stored and no cookies are set.** The session id is random and lives only in the page. With `ENABLE_LOGS=0` (the default) nothing is sent.

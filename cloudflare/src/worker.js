@@ -16,6 +16,22 @@ function sessionIdOf(raw) {
   return s || "unknown";
 }
 
+// Debug telemetry: server-seen User-Agent + country only. No IP, no cookies.
+async function shortHash(s) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return [...new Uint8Array(d).slice(0, 6)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+// Coarse per-isolate distinct-UA-per-day counter (isolates recycle, so this is
+// a lower bound; exact counts = count distinct uaHash in Workers Logs).
+let uaDay = "", uaSeen = new Set();
+function noteUa(hash, ua, country) {
+  const day = new Date().toISOString().slice(0, 10);
+  if (day !== uaDay) { uaDay = day; uaSeen = new Set(); }
+  if (uaSeen.has(hash)) return;
+  uaSeen.add(hash);
+  console.log({ event: "ua_daily", day, uaHash: hash, uniqueUasThisIsolate: uaSeen.size, reqUa: ua.slice(0, 300), country });
+}
+
 async function handleLogs(request, env) {
   if (request.method === "OPTIONS") return new Response(null, { status: 204 });
   if (request.method !== "POST") return json(405, { error: "POST only" });
@@ -34,6 +50,13 @@ async function handleLogs(request, env) {
 
   const cf = request.cf || {};
   const ua = request.headers.get("user-agent") || "";
+  const h = request.headers;
+  const chUa = (h.get("sec-ch-ua") || "").slice(0, 200) || undefined;
+  const chMobile = h.get("sec-ch-ua-mobile") || undefined;
+  const chPlatform = h.get("sec-ch-ua-platform") || undefined;
+  const country = h.get("cf-ipcountry") || cf.country;
+  const uaHash = await shortHash(ua);
+  noteUa(uaHash, ua, country);
   for (const line of lines) {
     const row =
       line && typeof line === "object"
@@ -42,8 +65,12 @@ async function handleLogs(request, env) {
     row.sessionId ??= sessionId;
     row.source = "car-browser";
     row.colo = cf.colo;
-    row.country = cf.country;
-    row.ua = ua.slice(0, 200);
+    row.country = country;
+    row.reqUa = ua.slice(0, 300);       // server-seen User-Agent header
+    row.uaHash = uaHash;                // stable short id for distinct-UA counts
+    if (chUa) row.chUa = chUa;
+    if (chMobile) row.chUaMobile = chMobile;
+    if (chPlatform) row.chUaPlatform = chPlatform;
     // One structured JSON object per log line → indexed fields in Workers Logs.
     if (row.level === "error") console.error(row);
     else if (row.level === "warn") console.warn(row);

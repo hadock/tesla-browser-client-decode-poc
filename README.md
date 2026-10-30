@@ -269,3 +269,5 @@ See `DISCLOSURE.md` and `SECURITY.md`. Intentional, minimal, not a consumer
 product.
 
 **Audio resilience (Live):** if the WebCodecs `AudioDecoder` errors (which closes it), it is rebuilt with the same config and the no-drop AAC queue keeps feeding it. A suspended/"interrupted" AudioContext (iOS lock screen, call, backgrounding) is resumed on the next tap/visibility return unless the user paused. `navigator.audioSession.type = "playback"` is set where supported so the iOS silent switch does not mute Web Audio. The decoded-audio budget is a sum of durations, so a PTS discontinuity can't stall decode.
+
+**Debug telemetry:** this is collected only when `ENABLE_LOGS=1`; see DISCLOSURE.md. Each load sends one `client_info` event (UA, userAgentData, platform, memory/cores, screen, touch). The Worker adds `reqUa`, the `Sec-CH-UA*` hints, `country` and `uaHash`, and logs a `ua_daily` event the first time a UA is seen that day in an isolate. No IP and no cookies. For exact counts, run `count distinct uaHash` in Workers Observability.

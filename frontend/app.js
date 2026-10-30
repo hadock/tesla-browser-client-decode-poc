@@ -140,6 +140,24 @@
     else if (!flushTimer) flushTimer = setTimeout(flushLogs, 2000);
   }
 
+  // Debug telemetry (only sent when ENABLE_LOGS is on): coarse client/device
+  // info so we can tell a Tesla in-car browser from a phone or desktop.
+  // No IP, no cookies, no fingerprint storage — one event per page load.
+  function clientInfo() {
+    const n = navigator, uad = n.userAgentData;
+    return {
+      ua: n.userAgent, platform: n.platform, vendor: n.vendor,
+      uad: uad ? { brands: (uad.brands || []).map(function (b) { return b.brand + "/" + b.version; }),
+                   mobile: !!uad.mobile, platform: uad.platform } : null,
+      deviceMemory: n.deviceMemory, hardwareConcurrency: n.hardwareConcurrency,
+      screen: (screen.width || 0) + "x" + (screen.height || 0) + "@" + (window.devicePixelRatio || 1),
+      viewport: (window.innerWidth || 0) + "x" + (window.innerHeight || 0),
+      maxTouchPoints: n.maxTouchPoints || 0,
+      webCodecs: typeof VideoDecoder !== "undefined", audioDecoder: typeof AudioDecoder !== "undefined"
+    };
+  }
+  setTimeout(function () { try { cwLog("info", "client_info", clientInfo()); } catch (_) {} }, 0);
+
   function flushLogs() {
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
     if (!LOGS_ENABLED || !logQueue.length || flushing) return;

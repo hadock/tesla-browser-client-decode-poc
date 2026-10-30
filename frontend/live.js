@@ -203,7 +203,7 @@
     this._audioMediaStartUs = 0;
     this._nextAudioTime = 0;
     this._avStartCtx = 0;
-    this._videoOriginUs = 0;
+    this._videoOriginUs = 0; this._audioMap = [];
     this._videoOriginSet = false;
     this._ptsOffsetUs = 0;
     this._lastRawPtsUs = null;
@@ -310,7 +310,7 @@
     this._audioMediaStartUs = 0;
     this._ptsOffsetUs = 0;
     this._lastRawPtsUs = null;
-    this._videoOriginUs = 0;
+    this._videoOriginUs = 0; this._audioMap = [];
     this._videoOriginSet = false;
     this._started = false;
     this._setStage("stopped");
@@ -321,6 +321,17 @@
     try { if (this._audioDec) this._audioDec.close(); } catch (_) {}
     this._videoDec = null;
     this._audioDec = null;
+  };
+
+  // Media PTS (µs) of the audio sample audible right now, from the schedule map.
+  LivePlayer.prototype._audibleMediaUs = function () {
+    var map = this._audioMap, ctx = this._audioCtx;
+    if (!ctx || !map || !map.length) return null;
+    var now = ctx.currentTime, lo = 0, hi = map.length - 1;
+    if (now < map[0].c) return null;
+    while (lo < hi) { var mid = (lo + hi + 1) >> 1; if (map[mid].c <= now) lo = mid; else hi = mid - 1; }
+    var e = map[lo];
+    return e.m + Math.min(now - e.c, e.d) * 1e6;
   };
 
   LivePlayer.prototype._aborted = function (gen) {
@@ -348,7 +359,7 @@
     this._audioMediaStartUs = 0;
     this._nextAudioTime = 0;
     this._avStartCtx = 0;
-    this._videoOriginUs = 0;
+    this._videoOriginUs = 0; this._audioMap = [];
     this._videoOriginSet = false;
     this._ptsOffsetUs = 0;
     this._lastRawPtsUs = null;
@@ -364,6 +375,7 @@
     this._lastAudioMediaTs = null;
     this._encodeInFlight = 0;
     this._audioQueue = [];
+    this._audioMap = [];
     this._closeDecoders();
     this.diag = this._freshDiag();
     this._patch({ streamId: stream.id, error: null });
@@ -1079,6 +1091,9 @@
               // Never start in the past (WebKit drops/clips those).
               if (this._nextAudioTime < this._audioCtx.currentTime) this._nextAudioTime = this._audioCtx.currentTime + 0.01;
               src.start(this._nextAudioTime);
+              // ctx-time → audio media PTS map (what is audible when).
+              this._audioMap.push({ c: this._nextAudioTime, m: ad.timestamp, d: ab.duration });
+              if (this._audioMap.length > 600) this._audioMap.splice(0, 200);
               this._nextAudioTime += ab.duration;
               this._audioScheduledSec += ab.duration;
             } catch (e) {
@@ -1139,6 +1154,20 @@
       if (this._audioCtx && this._avStartCtx) {
         elapsedUs = (this._audioCtx.currentTime - this._avStartCtx) * 1e6;
         nowVideoUs = this._videoOriginUs + elapsedUs;
+        // Lock the picture to what is actually AUDIBLE: audio media PTS at
+        // ctx.currentTime minus device output latency (car/BT pipelines can
+        // report hundreds of ms+). Falls back to elapsed clock if implausible.
+        var audNow = this._audibleMediaUs();
+        if (audNow != null) {
+          var lat = (this._audioCtx.outputLatency || 0) || (this._audioCtx.baseLatency || 0);
+          if (!(lat >= 0 && lat < 3)) lat = 0;
+          this.diag.outLatencyMs = Math.round(lat * 1000);
+          var lockUs = audNow + (this._ptsOffsetUs || 0) - lat * 1e6;
+          if (Math.abs(lockUs - nowVideoUs) < 3000000) {
+            nowVideoUs = lockUs;
+            this._videoOriginUs = lockUs - elapsedUs;
+          }
+        }
       } else {
         elapsedUs = (performance.now() - this._wallStart) * 1000;
         nowVideoUs = this._videoOriginUs + elapsedUs;
@@ -1171,6 +1200,8 @@
         this.diag.framesShown++;
         this.diag.framesDrawn = this.diag.framesShown;
         this.diag.driftMs = Math.round((head.ts - nowVideoUs) / 1000);
+        var aud = this._audibleMediaUs();
+        if (aud != null) this.diag.avSyncMs = Math.round((head.ts - (aud + (this._ptsOffsetUs || 0) - (this.diag.outLatencyMs || 0) * 1000)) / 1000);
         if (nowVideoUs > head.ts + 100000) this.diag.framesLate++;
         drained++;
       }

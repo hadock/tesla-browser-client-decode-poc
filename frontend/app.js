@@ -1501,6 +1501,7 @@
       ["Output latency", (d.outLatencyMs || 0) + " ms" + (d.avOffsetMs ? " · manual " + d.avOffsetMs + " ms" : ""), ""],
       ["Audio ctx", d.audioCtxState || "—", d.audioCtxState && d.audioCtxState !== "running" ? "warn" : "ok"],
       ["Audio out", d.audioOut || "—", ""],
+      ["Quality", (d.variantH ? d.variantH + "p src · " : "") + (d.outW || "?") + "w · q" + (d.jpegQ || "?") + " · L" + (d.qLevel != null ? d.qLevel : "?") + (d.encMsAvg != null ? " · enc " + d.encMsAvg + " ms" : ""), ""],
       ["Buffer", (d.bufferMs != null ? d.bufferMs + " ms" : "—"), ""],
       ["A/V drift", (d.driftMs != null ? d.driftMs + " ms" : "—"), Math.abs(d.driftMs || 0) > 120 ? "warn" : "ok"],
       ["<video> els", String(d.videoEls || 0), d.videoEls ? "bad" : "ok"],
@@ -1605,7 +1606,7 @@
               driftMs: d.driftMs, audioDecResets: d.audioDecResets || 0, audioCtxState: d.audioCtxState || null,
               audioUnderruns: d.audioUnderruns || 0, audioGaps150: d.audioGaps150 || 0, audioMaxGapMs: d.audioMaxGapMs || 0,
               framesLate: d.framesLate || 0, framesDropped: d.framesDropped || 0, framesShown: d.framesShown || 0,
-              audioOut: d.audioOut || null, mediaEls: (d.videoEls || 0) + (d.audioEls || 0)
+              audioOut: d.audioOut || null, outW: d.outW, jpegQ: d.jpegQ, variantH: d.variantH, qLevel: d.qLevel, qChanges: d.qChanges || 0, encMsAvg: d.encMsAvg, jpegKB: d.jpegKB, mediaEls: (d.videoEls || 0) + (d.audioEls || 0)
             });
           } catch (_) {}
         }

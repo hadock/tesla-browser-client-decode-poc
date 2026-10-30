@@ -139,6 +139,44 @@
     return (withVideo.length ? withVideo : sorted)[0];
   }
 
+  // Highest H.264 variant with height <= maxH (HEVC/VP9/AV1 skipped).
+  function pickVariant(master, maxH) {
+    if (!maxH) return pickLowVariant(master);
+    var vids = master.variants.filter(function (v) {
+      return v.resolution && !/hvc1|hev1|vp09|av01|dvh/i.test(v.codecs || "") &&
+        (!v.codecs || /avc1|avc3/i.test(v.codecs));
+    });
+    var ok = vids.filter(function (v) { return (+v.resolution.split("x")[1] || 0) <= maxH; });
+    if (!ok.length) return pickLowVariant(master);
+    ok.sort(function (a, b) {
+      return (+a.resolution.split("x")[1]) - (+b.resolution.split("x")[1]) || a.bandwidth - b.bandwidth;
+    });
+    var top = +ok[ok.length - 1].resolution.split("x")[1];
+    var same = ok.filter(function (v) { return +v.resolution.split("x")[1] === top; });
+    return same[0]; // lowest bitrate at the top allowed height
+  }
+
+  // Output quality ladder (JPEG width x quality). Adaptive: start at
+  // QUALITY_START, step up after ~5 s healthy, step down on pressure.
+  var QUALITY_LEVELS = [
+    { w: 426, q: 0.35 },
+    { w: 640, q: 0.5 },
+    { w: 854, q: 0.65 },
+    { w: 1280, q: 0.8 }
+  ];
+  var QUALITY_START = 1, QUALITY_MAX_VARIANT_H = 406;
+  function qualityOverrides() {
+    var o = {};
+    try {
+      var sp = new URLSearchParams(global.location ? global.location.search : "");
+      if (sp.get("qw")) o.w = +sp.get("qw");
+      if (sp.get("qq")) o.q = +sp.get("qq");
+      if (sp.get("qvh")) o.vh = +sp.get("qvh");
+      if (sp.get("qlevel")) o.level = +sp.get("qlevel");
+    } catch (_) {}
+    return o;
+  }
+
   function pickAudio(master, variant) {
     if (!variant.audio) return null;
     var group = master.medias.filter(function (m) { return m.groupId === variant.audio; });
@@ -204,7 +242,7 @@
     this._audioMediaStartUs = 0;
     this._nextAudioTime = 0;
     this._avStartCtx = 0;
-    this._videoOriginUs = 0; this._audioMap = []; this._lastSchedEnd = null;
+    this._videoOriginUs = 0; this._audioMap = []; this._lastSchedEnd = null; this._qT = 0; this._qHealthy = 0; this._qHold = 0; this._qLate = 0; this._qDrop = 0; this._qUnd = 0;
     this._videoOriginSet = false;
     this._ptsOffsetUs = 0;
     this._lastRawPtsUs = null;
@@ -311,7 +349,7 @@
     this._audioMediaStartUs = 0;
     this._ptsOffsetUs = 0;
     this._lastRawPtsUs = null;
-    this._videoOriginUs = 0; this._audioMap = []; this._lastSchedEnd = null;
+    this._videoOriginUs = 0; this._audioMap = []; this._lastSchedEnd = null; this._qT = 0; this._qHealthy = 0; this._qHold = 0; this._qLate = 0; this._qDrop = 0; this._qUnd = 0;
     this._videoOriginSet = false;
     this._started = false;
     this._setStage("stopped");
@@ -360,7 +398,7 @@
     this._audioMediaStartUs = 0;
     this._nextAudioTime = 0;
     this._avStartCtx = 0;
-    this._videoOriginUs = 0; this._audioMap = []; this._lastSchedEnd = null;
+    this._videoOriginUs = 0; this._audioMap = []; this._lastSchedEnd = null; this._qT = 0; this._qHealthy = 0; this._qHold = 0; this._qLate = 0; this._qDrop = 0; this._qUnd = 0;
     this._videoOriginSet = false;
     this._ptsOffsetUs = 0;
     this._lastRawPtsUs = null;
@@ -397,7 +435,9 @@
 
       var videoPlUrl, audioPlUrl = null, variantLabel = "media";
       if (master.isMaster) {
-        var variant = pickLowVariant(master);
+        var qo = this._qo = Object.assign(qualityOverrides(), this.opts.quality || {});
+        var variant = pickVariant(master, qo.vh != null ? qo.vh : QUALITY_MAX_VARIANT_H);
+        this.diag.variantH = variant.resolution ? +variant.resolution.split("x")[1] : null;
         variantLabel = (variant.resolution || "?") + " @ " + Math.round(variant.bandwidth / 1000) + " kbps";
         this._patch({ variant: variantLabel });
         this._setStage("fetch media playlist…");
@@ -521,8 +561,13 @@
 
     var MAX_READY = 48;
     var MAX_ENCODE_AHEAD = 24;
-    var MAX_DISPLAY_W = 426;
-    var JPEG_Q = 0.35;
+    var qo0 = self._qo || qualityOverrides();
+    self._fixedQuality = qo0.w != null || qo0.q != null || qo0.level != null;
+    self._qLevel = qo0.level != null ? Math.max(0, Math.min(QUALITY_LEVELS.length - 1, qo0.level)) : QUALITY_START;
+    self._outW = qo0.w || QUALITY_LEVELS[self._qLevel].w;
+    self._jpegQ = qo0.q || QUALITY_LEVELS[self._qLevel].q;
+    self.diag.outW = self._outW; self.diag.jpegQ = self._jpegQ; self.diag.qLevel = self._qLevel;
+    self._encMs = [];
 
     function frameTs(f) {
       return f.__ts != null ? f.__ts : f.timestamp;
@@ -530,9 +575,9 @@
 
     function ensureEncodeCanvas(srcW, srcH) {
       var w = srcW, h = srcH;
-      if (w > MAX_DISPLAY_W) {
-        h = Math.round(h * (MAX_DISPLAY_W / w));
-        w = MAX_DISPLAY_W;
+      if (w > self._outW) {
+        h = Math.round(h * (self._outW / w));
+        w = self._outW;
       }
       // Even dims help some JPEG encoders
       if (w & 1) w--;
@@ -575,9 +620,9 @@
 
     function sizeEncodeCanvas(canvas, ctx, srcW, srcH) {
       var w = srcW, h = srcH;
-      if (w > MAX_DISPLAY_W) {
-        h = Math.round(h * (MAX_DISPLAY_W / w));
-        w = MAX_DISPLAY_W;
+      if (w > self._outW) {
+        h = Math.round(h * (self._outW / w));
+        w = self._outW;
       }
       if (w & 1) w--;
       if (h & 1) h--;
@@ -638,12 +683,16 @@
           }
           try {
             if (c.toBlob) {
+              var encT0 = performance.now();
               c.toBlob(function (blob) {
+                self._encMs.push(performance.now() - encT0);
+                if (self._encMs.length > 48) self._encMs.shift();
                 if (!blob) { finish(null); return; }
+                self._jpegBytes = blob.size;
                 finish(URL.createObjectURL(blob));
-              }, "image/jpeg", JPEG_Q);
+              }, "image/jpeg", self._jpegQ);
             } else {
-              finish(c.toDataURL("image/jpeg", JPEG_Q));
+              finish(c.toDataURL("image/jpeg", self._jpegQ));
             }
           } catch (e) {
             self.diag.framesDropped++;
@@ -689,6 +738,7 @@
               self._ptsOffsetUs += (self._lastRawPtsUs + expect) - rawTs;
             }
           }
+          if (self._lastRawPtsUs != null) { var fd = rawTs - self._lastRawPtsUs; if (fd > 10000 && fd < 100000) self._frameMs = fd / 1000; }
           self._lastRawPtsUs = rawTs;
           var adjTs = rawTs + self._ptsOffsetUs;
           enqueueDecodedFrame(frame, adjTs);
@@ -830,9 +880,13 @@
         if (user === "video" && self._videoDec && self._videoDec.state === "configured") {
           timescale = videoTrackInfo.timescale || 1000;
           try {
+            // B-frame streams: transmuxed ctts can carry a negative
+            // composition offset written unsigned (cts = dts + 2^32 - x).
+            var vcts = s.cts;
+            if (s.dts != null && vcts - s.dts > 2147483648) vcts -= 4294967296;
             self._chunkQueue.push(new EncodedVideoChunk({
               type: s.is_sync ? "key" : "delta",
-              timestamp: (s.cts * 1e6) / timescale,
+              timestamp: (vcts * 1e6) / timescale,
               duration: (s.duration * 1e6) / timescale,
               data: s.data
             }));
@@ -1225,6 +1279,7 @@
         : nowVideoUs;
       this.diag.bufferMs = Math.max(0, Math.round((newest - nowVideoUs) / 1000));
       this.diag.readyQ = this._readyQueue.length;
+      this._adaptQuality();
       if (this.opts.onHud) {
         this.opts.onHud({
           time: Math.max(0, elapsedUs / 1e6),
@@ -1315,6 +1370,47 @@
       if (pullError) throw pullError;
       await this._wait(8);
     }
+  };
+
+  // Adaptive output quality. Evaluated ~1/s from the present loop.
+  LivePlayer.prototype._adaptQuality = function () {
+    var now = performance.now();
+    if (!this._started || (this._qT && now - this._qT < 1000)) return;
+    var first = !this._qT;
+    this._qT = now;
+    var enc = this._encMs || [], avg = 0;
+    for (var i = 0; i < enc.length; i++) avg += enc[i];
+    avg = enc.length ? avg / enc.length : 0;
+    this.diag.encMsAvg = Math.round(avg * 10) / 10;
+    this.diag.jpegKB = this._jpegBytes ? Math.round(this._jpegBytes / 102.4) / 10 : null;
+    var late = this.diag.framesLate || 0, drop = this.diag.framesDropped || 0;
+    var und = this.diag.audioUnderruns || 0;
+    var bad = !first && (late > (this._qLate || 0) || drop > (this._qDrop || 0) || und > (this._qUnd || 0));
+    this._qLate = late; this._qDrop = drop; this._qUnd = und;
+    if (first || this._fixedQuality) return;
+    var frameMs = this._frameMs || 40;
+    var lowBuf = this._readyQueue.length < 4 && this._encodePending.length > 2;
+    var heavy = avg > frameMs * 1.5;   // ENCODE_SLOTS=2 -> sustained limit ~2x frame time
+    if (bad || lowBuf || heavy) {
+      this._qHealthy = 0;
+      if (this._qLevel > 0) { this._setQLevel(this._qLevel - 1, bad ? "late" : lowBuf ? "buffer" : "encode"); this._qHold = now + 20000; }
+      return;
+    }
+    this._qHealthy = (this._qHealthy || 0) + 1;
+    var stepUpOk = avg < frameMs * 0.6 && this._readyQueue.length >= 8;
+    if (this._qHealthy >= 5 && stepUpOk && this._qLevel < QUALITY_LEVELS.length - 1 &&
+        (!this._qHold || now > this._qHold)) {
+      this._setQLevel(this._qLevel + 1, "healthy");
+      this._qHealthy = 0;
+    }
+  };
+  LivePlayer.prototype._setQLevel = function (lv, why) {
+    this._qLevel = lv;
+    this._outW = QUALITY_LEVELS[lv].w; this._jpegQ = QUALITY_LEVELS[lv].q;
+    this._encMs = [];
+    this.diag.qLevel = lv; this.diag.outW = this._outW; this.diag.jpegQ = this._jpegQ;
+    this.diag.qChanges = (this.diag.qChanges || 0) + 1;
+    this._emit("info", "live_quality", { level: lv, w: this._outW, q: this._jpegQ, why: why });
   };
 
   // Manual A/V offset fallback (no UI yet). Positive ms delays the picture.

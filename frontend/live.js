@@ -179,6 +179,7 @@
     this._gen = 0;
     this._stop = false;
     this._timers = [];
+    try { this.avOffsetMs = Number(localStorage.getItem("teslapoc.avOffsetMs")) || 0; } catch (_) { this.avOffsetMs = 0; }
     this._audioSources = [];
     this._audioGain = null;
     this._abortCtl = null;
@@ -203,7 +204,7 @@
     this._audioMediaStartUs = 0;
     this._nextAudioTime = 0;
     this._avStartCtx = 0;
-    this._videoOriginUs = 0; this._audioMap = [];
+    this._videoOriginUs = 0; this._audioMap = []; this._lastSchedEnd = null;
     this._videoOriginSet = false;
     this._ptsOffsetUs = 0;
     this._lastRawPtsUs = null;
@@ -225,7 +226,7 @@
       framesLate: 0, framesDropped: 0, audioChunks: 0,
       bufferMs: 0, driftMs: 0, audioBufferedMs: 0, readyQ: 0,
       audioQueuedSec: 0, audioDecQ: 0, audioChunkQ: 0,
-      audioUnderruns: 0, audioLastGapMs: 0,
+      audioUnderruns: 0, audioLastGapMs: 0, audioGaps150: 0, audioMaxGapMs: 0, audioDecResets: 0, avSyncMs: null, outLatencyMs: 0,
       error: null, videoEls: 0, audioEls: 0
     };
   };
@@ -310,7 +311,7 @@
     this._audioMediaStartUs = 0;
     this._ptsOffsetUs = 0;
     this._lastRawPtsUs = null;
-    this._videoOriginUs = 0; this._audioMap = [];
+    this._videoOriginUs = 0; this._audioMap = []; this._lastSchedEnd = null;
     this._videoOriginSet = false;
     this._started = false;
     this._setStage("stopped");
@@ -359,7 +360,7 @@
     this._audioMediaStartUs = 0;
     this._nextAudioTime = 0;
     this._avStartCtx = 0;
-    this._videoOriginUs = 0; this._audioMap = [];
+    this._videoOriginUs = 0; this._audioMap = []; this._lastSchedEnd = null;
     this._videoOriginSet = false;
     this._ptsOffsetUs = 0;
     this._lastRawPtsUs = null;
@@ -747,6 +748,7 @@
         };
         var aDesc = getAudioDescription(mp4file, audioTrackInfo.id);
         if (aDesc) aConfig.description = aDesc;
+        self.diag.audioCfg = aConfig.codec + "@" + aConfig.sampleRate + "/" + aConfig.numberOfChannels;
         self._audioDec = makeAudioDec();
         mp4file.setExtractionOptions(audioTrackInfo.id, "audio", { nbSamples: 50 });
         audioConfigured = true;
@@ -1011,7 +1013,7 @@
     }
 
     this._setStage("playing");
-    var lastPull = 0;
+    var lastPull = 0, pullInFlight = false, pullError = null;
     var lastBeat = performance.now();
     var vodDone = false;
 
@@ -1090,6 +1092,15 @@
               })(this._audioSources, src);
               // Never start in the past (WebKit drops/clips those).
               if (this._nextAudioTime < this._audioCtx.currentTime) this._nextAudioTime = this._audioCtx.currentTime + 0.01;
+              if (this._lastSchedEnd != null) {
+                var schedGap = this._nextAudioTime - this._lastSchedEnd;
+                if (schedGap > 0.15) {
+                  this.diag.audioGaps150 = (this.diag.audioGaps150 || 0) + 1;
+                  this.diag.audioMaxGapMs = Math.max(this.diag.audioMaxGapMs || 0, Math.round(schedGap * 1000));
+                }
+              }
+              this._lastSchedEnd = this._nextAudioTime + ab.duration;
+              if (!this.diag.audioOut) this.diag.audioOut = rate + "Hz/" + nCh + "ch/" + frames + "fr (cfg " + (this.diag.audioCfg || "?") + ")";
               src.start(this._nextAudioTime);
               // ctx-time → audio media PTS map (what is audible when).
               this._audioMap.push({ c: this._nextAudioTime, m: ad.timestamp, d: ab.duration });
@@ -1162,7 +1173,10 @@
           var lat = (this._audioCtx.outputLatency || 0) || (this._audioCtx.baseLatency || 0);
           if (!(lat >= 0 && lat < 3)) lat = 0;
           this.diag.outLatencyMs = Math.round(lat * 1000);
-          var lockUs = audNow + (this._ptsOffsetUs || 0) - lat * 1e6;
+          // avOffsetMs: manual fallback (+ = delay picture) if a device hides its latency.
+          var lockUs = audNow + (this._ptsOffsetUs || 0) - lat * 1e6 - (this.avOffsetMs || 0) * 1000;
+          this.diag.avOffsetMs = this.avOffsetMs || 0;
+          this.diag.audioCtxState = this._audioCtx.state;
           if (Math.abs(lockUs - nowVideoUs) < 3000000) {
             nowVideoUs = lockUs;
             this._videoOriginUs = lockUs - elapsedUs;
@@ -1201,7 +1215,7 @@
         this.diag.framesDrawn = this.diag.framesShown;
         this.diag.driftMs = Math.round((head.ts - nowVideoUs) / 1000);
         var aud = this._audibleMediaUs();
-        if (aud != null) this.diag.avSyncMs = Math.round((head.ts - (aud + (this._ptsOffsetUs || 0) - (this.diag.outLatencyMs || 0) * 1000)) / 1000);
+        if (aud != null) this.diag.avSyncMs = Math.round((head.ts - (aud + (this._ptsOffsetUs || 0) - (this.diag.outLatencyMs || 0) * 1000 - (this.avOffsetMs || 0) * 1000)) / 1000);
         if (nowVideoUs > head.ts + 100000) this.diag.framesLate++;
         drained++;
       }
@@ -1223,7 +1237,7 @@
           driftMs: this.diag.driftMs
         });
       }
-      if (performance.now() - lastBeat > 4000) {
+      if (performance.now() - lastBeat > 2500) {
         lastBeat = performance.now();
         this._countEls();
         if (this.opts.onDiag) this.opts.onDiag(this.diag);
@@ -1264,11 +1278,15 @@
 
       try { kickDecode(); } catch (_) {}
 
-      // Network pull AFTER A/V so a slow transmux cannot stall audio/picture.
-      if (performance.now() - lastPull > (media.endList ? 500 : Math.max(1000, media.targetDuration * 400))) {
+      // Network pull runs in the BACKGROUND (never awaited by this loop):
+      // awaiting playlist+segment fetch here froze picture and audio
+      // scheduling for the whole round trip (~1 s) at every segment join.
+      if (!pullInFlight && !vodDone &&
+          performance.now() - lastPull > (media.endList ? 500 : Math.max(1000, media.targetDuration * 400))) {
         lastPull = performance.now();
-        try {
-          if (!vodDone) {
+        pullInFlight = true;
+        (async function () {
+          try {
             media = await loadPlaylist(videoPlUrl);
             var n = await fetchNewSegments(media, seenV, offV, false);
             if (audioPlUrl) {
@@ -1283,14 +1301,26 @@
                 (!self._audioDec || self._audioDec.decodeQueueSize === 0)) {
               vodDone = true;
             }
+          } catch (e) {
+            if (!self._aborted(gen)) {
+              self._emit("warn", "live_pull", { msg: e.message });
+              if (!self._started) pullError = e;
+            }
+          } finally {
+            pullInFlight = false;
+            lastPull = performance.now();
           }
-        } catch (e) {
-          this._emit("warn", "live_pull", { msg: e.message });
-          if (!this._started) throw e;
-        }
+        })();
       }
+      if (pullError) throw pullError;
       await this._wait(8);
     }
+  };
+
+  // Manual A/V offset fallback (no UI yet). Positive ms delays the picture.
+  LivePlayer.prototype.setAvOffsetMs = function (ms) {
+    this.avOffsetMs = Math.max(-5000, Math.min(5000, Number(ms) || 0));
+    try { localStorage.setItem("teslapoc.avOffsetMs", String(this.avOffsetMs)); } catch (_) {}
   };
 
   global.LiveHls = {

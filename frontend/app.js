@@ -1495,6 +1495,12 @@
       ["Audio underruns", String(d.audioUnderruns || 0), (d.audioUnderruns || 0) > 0 ? "warn" : "ok"],
       ["Audio last gap", (d.audioLastGapMs != null ? d.audioLastGapMs + " ms" : "—"),
         (d.audioLastGapMs || 0) > 150 ? "warn" : "ok"],
+      ["Audio dec resets", String(d.audioDecResets || 0), (d.audioDecResets || 0) > 0 ? "warn" : "ok"],
+      ["Audio gaps >150ms", String(d.audioGaps150 || 0) + (d.audioMaxGapMs ? " (max " + d.audioMaxGapMs + " ms)" : ""), (d.audioGaps150 || 0) > 0 ? "warn" : "ok"],
+      ["A/V sync (video−audio)", (d.avSyncMs != null ? d.avSyncMs + " ms" : "—"), Math.abs(d.avSyncMs || 0) > 80 ? "warn" : "ok"],
+      ["Output latency", (d.outLatencyMs || 0) + " ms" + (d.avOffsetMs ? " · manual " + d.avOffsetMs + " ms" : ""), ""],
+      ["Audio ctx", d.audioCtxState || "—", d.audioCtxState && d.audioCtxState !== "running" ? "warn" : "ok"],
+      ["Audio out", d.audioOut || "—", ""],
       ["Buffer", (d.bufferMs != null ? d.bufferMs + " ms" : "—"), ""],
       ["A/V drift", (d.driftMs != null ? d.driftMs + " ms" : "—"), Math.abs(d.driftMs || 0) > 120 ? "warn" : "ok"],
       ["<video> els", String(d.videoEls || 0), d.videoEls ? "bad" : "ok"],
@@ -1586,7 +1592,24 @@
       onLog: function (level, event, fields) {
         cwLog(level, event, Object.assign({ clip: stream.id }, fields || {}));
       },
-      onDiag: function (d) { if (livePlayer !== thisPlayer) return; renderLiveDiag(d); refreshVideoElHud(); },
+      onDiag: function (d) {
+        if (livePlayer !== thisPlayer) return;
+        renderLiveDiag(d); refreshVideoElHud();
+        // Periodic sync telemetry (~5 s; cwLog only POSTs when ENABLE_LOGS is on).
+        var nowT = Date.now();
+        if (!thisPlayer._lastSyncLog || nowT - thisPlayer._lastSyncLog >= 4900) {
+          thisPlayer._lastSyncLog = nowT;
+          try {
+            cwLog("info", "live_sync", {
+              clip: stream.id, avSyncMs: d.avSyncMs, outLatencyMs: d.outLatencyMs, avOffsetMs: d.avOffsetMs || 0,
+              driftMs: d.driftMs, audioDecResets: d.audioDecResets || 0, audioCtxState: d.audioCtxState || null,
+              audioUnderruns: d.audioUnderruns || 0, audioGaps150: d.audioGaps150 || 0, audioMaxGapMs: d.audioMaxGapMs || 0,
+              framesLate: d.framesLate || 0, framesDropped: d.framesDropped || 0, framesShown: d.framesShown || 0,
+              audioOut: d.audioOut || null, mediaEls: (d.videoEls || 0) + (d.audioEls || 0)
+            });
+          } catch (_) {}
+        }
+      },
       onStage: function (stage) {
         if (livePlayer !== thisPlayer) return;
         if (liveStatusEl) liveStatusEl.textContent = stage;

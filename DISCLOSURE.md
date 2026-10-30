@@ -110,7 +110,7 @@ applies.
 
 ## Debug telemetry (only when `ENABLE_LOGS` is on)
 
-When the deployment is built with `ENABLE_LOGS=1`, the page sends debug log batches to `/api/logs`, and they go to Workers Logs. To tell a Tesla in-car browser apart from a phone or desktop, each page load also sends one `client_info` event with:
+When the deployment is built with `ENABLE_LOGS=1`, the page sends debug log batches to `/api/logs`, and they go to Workers Logs. To tell a Tesla in-car browser apart from a phone or desktop, each page load also sends one `client_info` event (and, during Live playback, a `live_sync` playback-health event about every 5 s: A/V sync, output latency, audio decoder resets, AudioContext state, audio gaps, late/dropped frames; no identifiers) with:
 - `navigator.userAgent`, `platform`, `vendor`
 - `userAgentData` (brands, mobile, platform)
 - `deviceMemory`, `hardwareConcurrency`

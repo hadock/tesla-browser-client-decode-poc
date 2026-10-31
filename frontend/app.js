@@ -1444,39 +1444,15 @@
   // overflow (then drop). The browser paints src updates; we revoke the prior
   // blob after a short delay. Never skip the head in the player — only hold
   // when a frame is still in the future relative to the audio clock.
-  // Double-buffered present: the visible <img> keeps the previous frame
-  // until the next JPEG is FULLY decoded off-screen (Image.decode()), then we
-  // swap src. The swap paints from the already-decoded image, so no blank/white
-  // gap (the old direct src swap left the <img> empty while big JPEGs decoded).
-  // Non-blocking: if a newer frame arrives while one is still decoding, the
-  // newer one supersedes it (the stale pending frame is revoked, never shown).
-  var livePending = null; // { url, img }
-  var liveSwapSeq = 0;
-  function liveCommit(url) {
+  function liveSetImg(url) {
+    if (!url) return false;
     if (livePrevUrl) liveRmUrl(livePrevUrl);
     livePrevUrl = liveObjectUrl;
     liveObjectUrl = url;
     liveFrameEl.src = url;
-  }
-  function liveSetImg(url) {
-    if (!url) return false;
     liveImgBusy = false;
-    if (livePending) { liveRmUrl(livePending.url); livePending.dead = true; livePending = null; liveDiagSuperseded++; }
-    var im = new Image();
-    var job = { url: url, img: im, dead: false, seq: ++liveSwapSeq };
-    livePending = job;
-    im.decoding = "async";
-    im.src = url;
-    var done = function () {
-      if (job.dead) return;
-      if (livePending === job) livePending = null;
-      liveCommit(url);
-    };
-    if (im.decode) im.decode().then(done, function () { if (!job.dead) { if (livePending === job) livePending = null; liveRmUrl(url); } });
-    else im.onload = done;
     return true;
   }
-  var liveDiagSuperseded = 0;
 
   if (liveFrameEl) {
     liveFrameEl.decoding = "async";
@@ -1553,7 +1529,6 @@
 
   function stopLive() {
     if (livePlayer) livePlayer.stop();
-    if (livePending) { livePending.dead = true; liveRmUrl(livePending.url); livePending = null; }
     liveActive = false;
     if (btnLiveStop) btnLiveStop.disabled = true;
     updateLiveStageUi(false, false);

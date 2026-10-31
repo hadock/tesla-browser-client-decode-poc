@@ -206,3 +206,4 @@ footer { color: var(--muted); font-size: 0.8rem; max-width: 1880px; margin: 0 au
 @media (max-width: 1000px), (orientation: portrait) {
   .tabs { padding: 4px 10px 0; }
 }
+#liveFrame, #liveStage { background: #000; }
